@@ -266,7 +266,8 @@ async def auto_sync(state, config=None) -> str:
     if not configured():
         try:        # junk rules still apply without the CRM
             from harvey import junk
-            await junk.apply(state)
+            from harvey.config import load_config
+            await junk.apply(state, config or load_config())
         except Exception as e:
             logger.warning(f"Junk check failed: {e}")
         return "CRM sync skipped: add SUPABASE_SERVICE_ROLE_KEY to .env to sync automatically"
@@ -315,7 +316,7 @@ async def sync(state, config, after_pull=None) -> tuple[int, int]:
     await pull_tags(state, url, key)
     if after_pull:
         await after_pull()
-    logger.info(junk.summary(await junk.apply(state)))
+    logger.info(junk.summary(await junk.apply(state, config)))
     brands, contacts = await build_rows(state, config)
     counts = await push(brands, contacts, url, key)
     logger.info(f"Synced {counts[0]} brands and {counts[1]} contacts to Supabase")

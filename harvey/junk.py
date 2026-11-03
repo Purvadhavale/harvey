@@ -41,6 +41,7 @@ NAME_RULES = [
      r"chamber of|association|council|foundation|university|college|institute)\b",
      "Government / incubator / institution"),
     (r"\b(built in|top \d+|list of|directory)\b", "Directory / listing site"),
+    (r"\b(news|magazine|travel guide)\b", "News / media / guide"),
     (r"(^(how|what|why|when|where|which|top|best|list|guide|local brands)\b|\?)",
      "Article or web page, not a brand"),
     (r"\b(digital solutions|web ?tech|infotech|it solutions|software|web development|"
@@ -69,8 +70,25 @@ def features(name: str, domain: str) -> set[str]:
     return out
 
 
-def rule_reason(name: str, domain: str) -> str:
+def icp_rules(config) -> list[tuple[str, re.Pattern | None, re.Pattern | None]]:
+    """icp.not_icp as (reason, name pattern, domain pattern)."""
+    out = []
+    for reason, spec in (getattr(getattr(config, "icp", None), "not_icp", None) or {}).items():
+        spec = spec or {}
+        words = [re.escape(str(w).strip().lower()) for w in spec.get("words") or [] if str(w).strip()]
+        domains = [re.escape(str(d).strip().lower()) for d in spec.get("domains") or [] if str(d).strip()]
+        out.append((f"Not our ICP: {reason}",
+                    re.compile(r"\b(" + "|".join(words) + r")\b") if words else None,
+                    re.compile("|".join(domains)) if domains else None))
+    return out
+
+
+def rule_reason(name: str, domain: str, extra=()) -> str:
+    """Why a company is junk by rule, or "". ``extra``: icp_rules(config)."""
     domain, name = (domain or "").lower(), (name or "").lower()
+    for reason, by_name, by_domain in extra:
+        if (by_name and by_name.search(name)) or (by_domain and by_domain.search(domain)):
+            return reason
     for pattern, reason in DOMAIN_RULES:
         if re.search(pattern, domain):
             return reason
@@ -91,13 +109,14 @@ def learn(tags: list[dict]) -> dict[str, int]:
             if n >= MIN_JUNK_TAGS and not real[f] and f.startswith("word:")}
 
 
-def judge(company: dict, tags_by_id: dict[str, dict], learned: dict[str, int]) -> tuple[str, str]:
-    """(reason, source) — reason '' means a real brand."""
+def judge(company: dict, tags_by_id: dict[str, dict], learned: dict[str, int],
+          extra=()) -> tuple[str, str]:
+    """(reason, source) — reason '' means a real brand. ``extra``: icp_rules(config)."""
     tag = tags_by_id.get(company["id"])
     if tag is not None:
         return ((tag.get("reason") or "Tagged junk by the team"), "team") if tag.get("junk") else ("", "team")
     name, domain = company.get("name", ""), company.get("domain", "")
-    if reason := rule_reason(name, domain):
+    if reason := rule_reason(name, domain, extra):
         return reason, "rule"
     hits = sorted((f for f in features(name, domain) if f in learned), key=lambda f: -learned[f])
     if hits:
@@ -107,10 +126,12 @@ def judge(company: dict, tags_by_id: dict[str, dict], learned: dict[str, int]) -
     return "", ""
 
 
-async def apply(state) -> dict:
-    """Re-judge every company from the stored tags. Returns counts by source."""
+async def apply(state, config=None) -> dict:
+    """Re-judge every company from the stored tags (and the config's
+    icp.not_icp, when given). Returns counts by source."""
     import aiosqlite
 
+    extra = icp_rules(config)
     tags = await state.brand_tags()
     by_id = {t["company_id"]: t for t in tags}
     learned = learn(tags)
@@ -122,7 +143,7 @@ async def apply(state) -> dict:
             companies = [dict(r) for r in await cur.fetchall()]
     changes, counts = {}, Counter()
     for c in companies:
-        reason, source = judge(c, by_id, learned)
+        reason, source = judge(c, by_id, learned, extra)
         if reason:
             counts[source] += 1
         if (reason, source if reason else "") != (c["junk"], c["junk_source"]):

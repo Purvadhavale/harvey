@@ -86,6 +86,11 @@ class ICPConfig(BaseModel):
     # Brand-fit weights, e.g. {"sectors": {"Footwear brand": 25}, "meta_ads": 30}.
     # Keys not given keep their defaults (harvey.brand_fit.DEFAULTS).
     brand_fit: dict = {}
+    # Kinds of company that are never a customer, by reason. Each has
+    # "words" (whole words in the name) and "domains" (text anywhere in the
+    # domain). A match is junk with that reason (harvey/junk.py), e.g.
+    #   {"Car / bike (automotive)": {"words": ["motorcycle"], "domains": ["motors"]}}
+    not_icp: dict = {}
 
     @field_validator("search_country", mode="before")
     @classmethod

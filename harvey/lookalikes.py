@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 from harvey.collectors.discover import (business_name, is_junk, name_from_domain,
                                         name_matches_domain, normalize_domain)
-from harvey.junk import rule_reason
+from harvey.junk import icp_rules, rule_reason
 from harvey.models.company import Company
 
 logger = logging.getLogger("harvey.lookalikes")
@@ -72,7 +72,7 @@ async def _search(client, api_key: str, q: str, country: str) -> list[dict]:
 _BLOG_PATH = re.compile(r"/(blogs?|journal|stories|magazine)(/|$)", re.I)
 
 
-def _brand_site(item: dict, liked: dict) -> tuple[str, str] | None:
+def _brand_site(item: dict, liked: dict, extra=()) -> tuple[str, str] | None:
     """(name, domain) when a search result is a brand's own site: its home
     page, or a blog post on it. A brand writing "top footwear brands in
     India" on its own blog is usually a D2C brand in the same market; an
@@ -89,7 +89,7 @@ def _brand_site(item: dict, liked: dict) -> tuple[str, str] | None:
         return None
     title = "" if blog else (item.get("title") or "")
     name = business_name(title, domain) if title else name_from_domain(domain)
-    if is_junk(domain, name) or rule_reason(name, domain) or (title and rule_reason(title, domain)):
+    if is_junk(domain, name) or rule_reason(name, domain, extra) or (title and rule_reason(title, domain, extra)):
         return None
     return name, domain
 
@@ -101,6 +101,7 @@ async def find_lookalikes(state, config, api_key: str, client=None,
 
     country = (getattr(getattr(config, "icp", None), "search_country", "") or "").lower()
     likes = await state.brand_likes(unsearched_only=True, limit=max_likes)
+    extra = icp_rules(config)
     counts = {"likes": len(likes), "searches": 0, "added": 0, "known": 0, "added_ids": []}
     if not likes or not api_key:
         return counts
@@ -119,7 +120,7 @@ async def find_lookalikes(state, config, api_key: str, client=None,
                     continue
                 counts["searches"] += 1
                 for item in items:
-                    site = _brand_site(item, like)
+                    site = _brand_site(item, like, extra)
                     if site:
                         found.setdefault(site[1], (site[0], item.get("link") or ""))
                     text = f"{item.get('title') or ''}. {item.get('snippet') or ''}"
@@ -134,7 +135,7 @@ async def find_lookalikes(state, config, api_key: str, client=None,
                     continue
                 counts["searches"] += 1
                 for item in items[:3]:
-                    site = _brand_site(item, like)
+                    site = _brand_site(item, like, extra)
                     if site and name_matches_domain(name, site[1]):
                         found.setdefault(site[1], (name, item.get("link") or ""))
                         break

@@ -85,3 +85,16 @@ async def test_pull_tags_replaces_the_set(state):
     rows, _ = await ss.build_rows(state, CONFIG)
     assert rows[0]["is_junk"] and rows[0]["junk_source"] == "team"
     assert rows[0]["next_step"] == "Skip: IT agency"
+
+
+def test_not_icp_rules_from_config():
+    from types import SimpleNamespace
+    config = SimpleNamespace(icp=SimpleNamespace(not_icp={
+        "Mall": {"words": ["mall", "market city"], "domains": ["marketcity"]},
+        "Automotive": {"words": ["motorcycle"]}}))
+    extra = junk.icp_rules(config)
+    assert junk.rule_reason("Kopa Mall", "kopa.example", extra) == "Not our ICP: Mall"
+    assert junk.rule_reason("Phoenix", "phoenixmarketcity.example", extra) == "Not our ICP: Mall"
+    assert junk.rule_reason("Zed Motorcycle Gear", "zed.example", extra) == "Not our ICP: Automotive"
+    assert junk.rule_reason("Smallworld Toys", "smallworld.example", extra) == ""     # whole words only
+    assert junk.judge({"id": "c", "name": "Kopa Mall", "domain": "k.example"}, {"c": {"junk": 0}}, {}, extra) == ("", "team")
