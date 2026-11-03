@@ -50,3 +50,15 @@ import harvey.humanize  # noqa: E402
 def _no_installed_humanizer(monkeypatch, tmp_path):
     """Tests never pick up the operator's real ~/.claude Humanizer skill."""
     monkeypatch.setattr(harvey.humanize, "SKILL_PATH", tmp_path / "no-humanizer.md")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_supabase(monkeypatch):
+    """Tests never reach the real CRM: lead steps sync to Supabase when
+    .env has a key, and fixture data must never land there. Tests of the
+    sync itself patch credentials() again."""
+    from harvey import supabase_sync
+
+    def _none():
+        raise RuntimeError("Supabase is off in tests")
+    monkeypatch.setattr(supabase_sync, "credentials", _none)

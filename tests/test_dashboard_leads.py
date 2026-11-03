@@ -79,7 +79,8 @@ def test_reverify_step_runs_in_background_and_reports(client, monkeypatch):
         if job.get("finished"):
             break
         time.sleep(0.05)
-    assert job["result"] == {"email_status": {"verified": 2}}
+    assert job["result"]["email_status"] == {"verified": 2}
+    assert "skipped" in job["result"]["crm_sync"]       # no key in tests: never the real CRM
     assert client.post("/api/leads/run", json={"step": "nope"}).status_code == 400
 
 

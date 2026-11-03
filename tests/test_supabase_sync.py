@@ -94,3 +94,21 @@ async def test_push_reports_a_refused_upsert():
             lambda r: httpx.Response(401, text="bad key"))) as client:
         with pytest.raises(RuntimeError, match="HTTP 401"):
             await ss.push([{"id": "b1"}], [], "https://proj.example", "x", client=client)
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_skips_without_a_key_and_never_raises(state, monkeypatch):
+    monkeypatch.setattr(ss, "credentials", lambda: (_ for _ in ()).throw(RuntimeError("no key")))
+    assert "skipped" in await ss.auto_sync(state, CONFIG)
+
+    monkeypatch.setattr(ss, "credentials", lambda: ("https://proj.example", "k"))
+
+    async def boom(state, config):
+        raise RuntimeError("HTTP 401")
+    monkeypatch.setattr(ss, "sync", boom)
+    assert await ss.auto_sync(state, CONFIG) == "CRM sync failed: HTTP 401"
+
+    async def ok(state, config):
+        return 3, 5
+    monkeypatch.setattr(ss, "sync", ok)
+    assert await ss.auto_sync(state, CONFIG) == "Synced to CRM: 3 brands, 5 contacts"

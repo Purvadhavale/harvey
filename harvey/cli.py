@@ -583,6 +583,20 @@ def cmd_profile(args):
         print("\n  See what turned up: harvey dashboard → Signals\n")
 
     asyncio.run(_profile())
+    _auto_sync()
+
+
+def _auto_sync():
+    """After a lead command: copy the results to the CRM (Supabase), if set up."""
+    from harvey.state import StateManager
+    from harvey.supabase_sync import auto_sync
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        return await auto_sync(state)
+
+    print(f"  {asyncio.run(_run())}\n")
 
 
 def cmd_sync(args):
@@ -636,6 +650,7 @@ def cmd_leads(args):
         print("  Export: harvey export\n")
 
     asyncio.run(_leads())
+    _auto_sync()
 
 
 def cmd_reverify(args):
@@ -674,6 +689,7 @@ def cmd_reverify(args):
         print()
 
     asyncio.run(_reverify())
+    _auto_sync()
 
 
 def cmd_discover(args):
@@ -799,6 +815,7 @@ def cmd_discover(args):
         print("\n  Next: harvey dashboard → Signals → cohort builder\n")
 
     asyncio.run(_discover())
+    _auto_sync()
 
 
 def cmd_signals(args):

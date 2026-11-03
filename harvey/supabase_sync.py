@@ -195,6 +195,32 @@ async def push(brands: list[dict], contacts: list[dict], url: str, key: str,
     return len(brands), len(contacts)
 
 
+def configured() -> bool:
+    """Are SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY set?"""
+    try:
+        credentials()
+        return True
+    except RuntimeError:
+        return False
+
+
+async def auto_sync(state, config=None) -> str:
+    """Sync after a lead step, when Supabase is set up. Never raises: a
+    failed sync must not fail the step that found the leads. Returns a
+    one-line outcome for the log or the page."""
+    if not configured():
+        return "CRM sync skipped: add SUPABASE_SERVICE_ROLE_KEY to .env to sync automatically"
+    try:
+        if config is None:
+            from harvey.config import load_config
+            config = load_config()
+        brands, contacts = await sync(state, config)
+        return f"Synced to CRM: {brands} brands, {contacts} contacts"
+    except Exception as e:
+        logger.warning(f"CRM sync failed: {e}")
+        return f"CRM sync failed: {e}"
+
+
 async def sync(state, config) -> tuple[int, int]:
     """Build the rows and push them. Returns (brands, contacts) sent."""
     url, key = credentials()

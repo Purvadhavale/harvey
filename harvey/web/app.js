@@ -1013,6 +1013,7 @@ function renderDiscoverResult(report, running) {
   }
   if (!report) { el.innerHTML = ''; return; }
 
+  const synced = report.crm_sync ? '<div class="cell-sub" style="margin-top:10px">' + escHtml(report.crm_sync) + '</div>' : '';
   const stat = (label, value, tone) =>
     '<div class="stat-card"><div class="label">' + label + '</div>' +
     '<div class="value"' + (tone ? ' style="color:var(--' + tone + ')"' : '') + '>' +
@@ -1022,7 +1023,7 @@ function renderDiscoverResult(report, running) {
     el.innerHTML = '<div class="subhead">Last run</div><div class="stats-grid">' +
       stat('Websites read', report.profiled_companies || 0, 'accent') +
       stat('Facts recorded', report.profile_observations || 0) +
-      stat('Cost', 'free') + '</div>' +
+      stat('Cost', 'free') + '</div>' + synced +
       (report.stopped ? '<div class="test-result error" style="margin-top:14px">Stopped early: ' + escHtml(report.stopped) + '</div>' : '');
     return;
   }
@@ -1034,7 +1035,7 @@ function renderDiscoverResult(report, running) {
       stat('Filtered as junk', report.junk || 0) +
       (report.profiled_companies ? stat('Websites read', report.profiled_companies) : '') +
       stat('Actual cost', report.actual_cost ? '$' + report.actual_cost.toFixed(4) : 'free') +
-    '</div>' +
+    '</div>' + synced +
     (report.stopped ? '<div class="test-result error" style="margin-top:14px">' +
       'Stopped early: ' + escHtml(report.stopped) + '</div>' : '') +
     ((report.errors || []).length
@@ -1374,7 +1375,8 @@ function renderLeadsJob(s) {
     const r = job.result;
     head += '<div class="qdetail" style="margin-top:6px">' + (r.contacts_added !== undefined
       ? r.contacts_added + ' new contact(s)'
-      : Object.entries(r.email_status || {}).map(([k, v]) => v + ' ' + k).join(' · ') || 'nothing to re-check') + '</div>';
+      : Object.entries(r.email_status || {}).map(([k, v]) => v + ' ' + k).join(' · ') || 'nothing to re-check') + '</div>' +
+      (r.crm_sync ? '<div class="cell-sub">' + escHtml(r.crm_sync) + '</div>' : '');
   }
   el.innerHTML = head + ((job.log || []).length
     ? '<pre class="leads-log">' + escHtml(job.log.join('\n')) + '</pre>' : '');

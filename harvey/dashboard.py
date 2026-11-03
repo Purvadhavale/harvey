@@ -1838,6 +1838,8 @@ async def start_discovery(request: Request):
                     "profile_observations": result.profile_observations,
                     "errors": result.errors,
                 }
+                from harvey.supabase_sync import auto_sync
+                _discovery_report["crm_sync"] = await auto_sync(state, config)
             except Exception as exc:
                 logger.exception("discovery run failed")
                 _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
@@ -1883,6 +1885,8 @@ async def start_profile():
                     "profiled_companies": companies,
                     "profile_observations": observations,
                 }
+                from harvey.supabase_sync import auto_sync
+                _discovery_report["crm_sync"] = await auto_sync(state, config)
             except Exception as exc:
                 logger.exception("profile run failed")
                 _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
@@ -2721,6 +2725,10 @@ async def start_leads_step(request: Request):
                     if found == 0:
                         break
                 _leads_job["result"] = {"contacts_added": total}
+            from harvey.supabase_sync import auto_sync
+            note = await auto_sync(state)
+            _leads_job.setdefault("log", []).append(f"{datetime.now().strftime('%H:%M:%S')}  {note}")
+            _leads_job["result"]["crm_sync"] = note
         except Exception as exc:
             logger.exception("lead step failed")
             _leads_job["error"] = str(exc)
