@@ -12,6 +12,7 @@ import csv
 import io
 
 from harvey.config import ComplianceConfig, live_do_not_contact
+from harvey.brand_fit import SIGNALS as BRAND_SIGNALS, brand_fit
 from harvey.fit import company_fit, current_roles
 from harvey.gate import do_not_contact_match
 
@@ -113,8 +114,8 @@ async def build_register(query_db, config, company_id: str | None = None) -> lis
         "WHERE 1=1" + one.format(col="p.company_id"), args)
     observations = await query_db(
         "SELECT company_id, signal_code, value_text, value_num, observed_at FROM observations "
-        "WHERE signal_code IN "
-        "('DECISION_MAKER_TITLE', 'CONTACT_FORM_URL', 'HIRING_ROLE')" + one.format(col="company_id"), args)
+        "WHERE signal_code IN ('DECISION_MAKER_TITLE', 'CONTACT_FORM_URL', "
+        + ", ".join(f"'{c}'" for c in BRAND_SIGNALS) + ")" + one.format(col="company_id"), args)
     by_p: dict[str, list] = {}
     by_o: dict[str, list] = {}
     by_obs: dict[str, list] = {}
@@ -129,7 +130,11 @@ async def build_register(query_db, config, company_id: str | None = None) -> lis
     for c in companies:
         cid = c["id"]
         ps, obs = by_p.get(cid, []), by_obs.get(cid, [])
-        fit, reasons = company_fit(c, ps, obs, config, dnc)
+        ready, ready_reasons = company_fit(c, ps, obs, config, dnc)
+        if getattr(getattr(config, "icp", None), "fit_model", "contact") == "brand":
+            fit, reasons = brand_fit(c, ps, obs, config, dnc)
+        else:
+            fit, reasons = ready, ready_reasons
         status, why = company_status(c, ps, by_o.get(cid, []), obs, dnc, send_to_risky)
         sector, area = c.get("industry") or "", c.get("location") or ""
         found = f"Found via {c['source']}" if c.get("source") else ""
@@ -137,6 +142,10 @@ async def build_register(query_db, config, company_id: str | None = None) -> lis
             # id and fit_reasons are for the dashboard; the CSV leaves them out.
             "id": cid,
             "fit_reasons": reasons,
+            # Contact readiness (harvey/fit.py): the same as fit unless
+            # icp.fit_model is "brand".
+            "ready": ready,
+            "ready_reasons": ready_reasons,
             "company": c.get("name") or c.get("domain") or "",
             "website": c.get("website") or (f"https://{c['domain']}" if c.get("domain") else ""),
             "sector": sector,

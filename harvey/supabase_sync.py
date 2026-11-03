@@ -129,6 +129,8 @@ async def build_rows(state, config) -> tuple[list[dict], list[dict]]:
             "junk_source": junk_source,
             "fit": int(reg.get("fit") or 0),
             "fit_reasons": " · ".join(reg.get("fit_reasons") or []),
+            "ready": int(reg.get("ready") or 0),
+            "ready_reasons": " · ".join(reg.get("ready_reasons") or []),
             "next_step": "Skip: " + junk if junk else next_step(people, sig, phone_type, titles),
             "phone": (c.get("phone") or "") if phone_type else "",
             "phone_type": phone_type,

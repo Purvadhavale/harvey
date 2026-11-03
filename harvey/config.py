@@ -78,6 +78,14 @@ class ICPConfig(BaseModel):
     # Two-letter country Google searches run from (Serper's "gl"), e.g. "IN".
     # Empty → Serper's default, which is the US.
     search_country: str = ""
+    # What "fit" measures: "contact" (a reachable decision maker and a
+    # deliverable email; harvey/fit.py) or "brand" (how good a customer the
+    # company itself is; harvey/brand_fit.py). The other is still worked
+    # out and shown as contact readiness.
+    fit_model: str = "contact"
+    # Brand-fit weights, e.g. {"sectors": {"Footwear brand": 25}, "meta_ads": 30}.
+    # Keys not given keep their defaults (harvey.brand_fit.DEFAULTS).
+    brand_fit: dict = {}
 
     @field_validator("search_country", mode="before")
     @classmethod
