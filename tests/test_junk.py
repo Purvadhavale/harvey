@@ -70,6 +70,8 @@ async def test_pull_tags_replaces_the_set(state):
     cid = await state.add_company(Company(name="Acme Ventures", domain="acme.example"))
 
     def handler(request):
+        if "liked=is.true" in str(request.url):
+            return httpx.Response(200, json=[])
         assert "junk=not.is.null" in str(request.url)
         return httpx.Response(200, json=[
             {"brand_id": cid, "junk": True, "junk_reason": "IT agency", "junk_by": "asha", "junk_at": None},

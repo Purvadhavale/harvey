@@ -23,7 +23,8 @@ DOMAIN_RULES = [
     (r"(^|\.)(startupindia|startup|startups|investindia|meity|msme|dpiit)[.-]", "Government / startup portal"),
     (r"(builtin|tracxn|crunchbase|yourstory|inc42|startus-insights|f6s|angel\.co|wellfound|"
      r"zaubacorp|tofler|justdial|indiamart|sulekha|clutch\.co|goodfirms|g2\.com|"
-     r"ambitionbox|glassdoor|naukri|indeed|internshala|shine\.com|foundit)", "Directory / listing site"),
+     r"ambitionbox|glassdoor|naukri|indeed|internshala|shine\.com|foundit|rocketreach|zoominfo|"
+     r"owler|leadiq|apollo\.io|signalhire|contactout|lusha|cbinsights|lbb\.in)", "Directory / listing site"),
     (r"(wikipedia|linkedin|facebook|instagram|youtube|twitter|(^|\.)x\.com$|quora|reddit|medium\.com|"
      r"pinterest|economictimes|livemint|moneycontrol|business-standard|thehindu|"
      r"timesofindia|ndtv|hindustantimes|forbesindia|entrackr|vccircle)", "News / social site"),

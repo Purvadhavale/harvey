@@ -2592,6 +2592,7 @@ LEADS_STEPS = {
     "linkedin": "Find marketing people via LinkedIn search",
     "reverify": "Re-check guessed emails",
     "retry": "Try other email formats for invalid ones",
+    "lookalike": "Find brands like the liked ones",
 }
 
 
@@ -2658,6 +2659,7 @@ async def get_leads_status():
             "team_pending": sum(1 for r in brands if not r["prospects_checked_at"]),
             "linkedin_searched": people_searched,
             "linkedin_pending": sum(1 for r in brands if not r["people_searched_at"]),
+            "likes_pending": len(await state.brand_likes(unsearched_only=True)),
             "phones": sum(1 for r in brands if r["phone_type"]),
             "linkedin_pages": signal_counts.get("LINKEDIN_PAGE", 0),
             "instagram": instagram,
@@ -2704,7 +2706,16 @@ async def start_leads_step(request: Request):
             state = _state()
             await state.init_db()
             env = load_env()
-            if kind == "retry":
+            if kind == "lookalike":
+                from harvey.supabase_sync import configured, credentials, pull_tags, search_likes
+                if not configured():
+                    raise RuntimeError("Likes live in the CRM: add SUPABASE_SERVICE_ROLE_KEY to .env")
+                url, key = credentials()
+                await pull_tags(state, url, key)
+                note = await search_likes(state, load_config()) or "No new liked brands to search from"
+                logger.info(note)
+                _leads_job["result"] = {"lookalikes": note}
+            elif kind == "retry":
                 from harvey.integrations.email_finder import retry_invalid_named
                 counts = await retry_invalid_named(state, env, limit=int(body.get("limit") or 50))
                 _leads_job["result"] = {"email_status": counts}

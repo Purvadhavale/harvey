@@ -103,12 +103,12 @@ async def test_auto_sync_skips_without_a_key_and_never_raises(state, monkeypatch
 
     monkeypatch.setattr(ss, "credentials", lambda: ("https://proj.example", "k"))
 
-    async def boom(state, config):
+    async def boom(state, config, **kw):
         raise RuntimeError("HTTP 401")
     monkeypatch.setattr(ss, "sync", boom)
     assert await ss.auto_sync(state, CONFIG) == "CRM sync failed: HTTP 401"
 
-    async def ok(state, config):
+    async def ok(state, config, **kw):
         return 3, 5
     monkeypatch.setattr(ss, "sync", ok)
     assert await ss.auto_sync(state, CONFIG) == "Synced to CRM: 3 brands, 5 contacts"

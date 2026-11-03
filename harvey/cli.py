@@ -599,6 +599,26 @@ def _auto_sync():
     print(f"  {asyncio.run(_run())}\n")
 
 
+def cmd_lookalikes(args):
+    """Search for brands like the ones liked in the CRM, then read their sites."""
+    from harvey.config import load_config
+    from harvey.state import StateManager
+    from harvey.supabase_sync import configured, credentials, pull_tags, search_likes
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        if not configured():
+            print("  Likes live in the CRM: add SUPABASE_SERVICE_ROLE_KEY to .env first.")
+            return
+        url, key = credentials()
+        await pull_tags(state, url, key)
+        print(f"  {await search_likes(state, load_config()) or 'No new liked brands to search from'}")
+
+    asyncio.run(_run())
+    _auto_sync()
+
+
 def cmd_sync(args):
     """Copy the lead list (brands + contacts) to Supabase."""
     from harvey.config import load_config
@@ -1167,6 +1187,11 @@ def main():
     sub = subparsers.add_parser(
         "sync", help="Copy all brands and contacts to Supabase (tables: brands, contacts)")
     sub.set_defaults(func=cmd_sync)
+
+    sub = subparsers.add_parser(
+        "lookalikes", help="Find brands like the ones liked in the CRM (2-8 Serper searches each, "
+                           "once per liked brand), read their sites and sync")
+    sub.set_defaults(func=cmd_lookalikes)
 
     # harvey companies
     sub = subparsers.add_parser(

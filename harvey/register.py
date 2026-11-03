@@ -12,7 +12,7 @@ import csv
 import io
 
 from harvey.config import ComplianceConfig, live_do_not_contact
-from harvey.brand_fit import SIGNALS as BRAND_SIGNALS, brand_fit
+from harvey.brand_fit import SIGNALS as BRAND_SIGNALS, brand_fit, traits
 from harvey.fit import company_fit, current_roles
 from harvey.gate import do_not_contact_match
 
@@ -124,6 +124,7 @@ async def build_register(query_db, config, company_id: str | None = None) -> lis
             by.setdefault(r["company_id"], []).append(r)
 
     dnc = _do_not_contact(config)
+    liked = await _liked(query_db, by_obs)
     channels = getattr(config, "channels", None)
     send_to_risky = bool(getattr(getattr(channels, "email", None), "send_to_risky", False))
     rows = []
@@ -132,7 +133,7 @@ async def build_register(query_db, config, company_id: str | None = None) -> lis
         ps, obs = by_p.get(cid, []), by_obs.get(cid, [])
         ready, ready_reasons = company_fit(c, ps, obs, config, dnc)
         if getattr(getattr(config, "icp", None), "fit_model", "contact") == "brand":
-            fit, reasons = brand_fit(c, ps, obs, config, dnc)
+            fit, reasons = brand_fit(c, ps, obs, config, dnc, liked)
         else:
             fit, reasons = ready, ready_reasons
         status, why = company_status(c, ps, by_o.get(cid, []), obs, dnc, send_to_risky)
@@ -165,6 +166,26 @@ async def build_register(query_db, config, company_id: str | None = None) -> lis
         })
     rows.sort(key=lambda r: r["fit"], reverse=True)
     return rows
+
+
+async def _liked(query_db, by_obs: dict) -> list[dict]:
+    """The team's liked brands, with the signals look-alikes are matched on.
+    Reads every observation of a liked brand, not just ``by_obs`` (which is
+    one company's when the register is built for one)."""
+    try:
+        rows = await query_db(
+            "SELECT c.id, c.name, c.industry FROM brand_likes l JOIN companies c ON c.id = l.company_id")
+    except Exception:       # a database from before brand_likes
+        return []
+    out = []
+    for r in rows:
+        obs = by_obs.get(r["id"]) or await query_db(
+            "SELECT signal_code, value_text, value_num, observed_at FROM observations "
+            "WHERE company_id = ? AND signal_code IN (" + ", ".join(f"'{c}'" for c in BRAND_SIGNALS) + ")",
+            (r["id"],))
+        out.append({"id": r["id"], "name": r["name"] or "", "industry": r["industry"] or "",
+                    "traits": traits(obs)})
+    return out
 
 
 def _do_not_contact(config) -> list[str]:

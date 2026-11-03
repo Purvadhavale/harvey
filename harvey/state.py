@@ -554,6 +554,17 @@ MIGRATIONS: list[str] = [
         tagged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """,
+    # ── v18: brands the team liked in the CRM: find more like them ──
+    """
+    -- searched_at: when Harvey last searched for look-alikes of this brand
+    -- (once per like; kept when the like is re-read at the next sync).
+    CREATE TABLE IF NOT EXISTS brand_likes (
+        company_id TEXT PRIMARY KEY,
+        liked_by TEXT DEFAULT '',
+        liked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        searched_at TIMESTAMP DEFAULT NULL
+    );
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -2063,6 +2074,39 @@ class StateManager:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM brand_tags") as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
+
+    async def save_brand_likes(self, likes: list[dict]) -> int:
+        """The CRM's current likes: add new ones, drop removed ones, and
+        keep when each was searched."""
+        async with self._connect() as db:
+            ids = [like["company_id"] for like in likes]
+            await db.execute(
+                f"DELETE FROM brand_likes WHERE company_id NOT IN ({','.join('?' * len(ids))})", ids)
+            await db.executemany(
+                """INSERT INTO brand_likes (company_id, liked_by, liked_at)
+                   VALUES (:company_id, :liked_by, COALESCE(:liked_at, CURRENT_TIMESTAMP))
+                   ON CONFLICT(company_id) DO UPDATE SET liked_by = excluded.liked_by""",
+                [{"liked_by": "", "liked_at": None, **like} for like in likes],
+            )
+            await db.commit()
+        return len(likes)
+
+    async def brand_likes(self, unsearched_only: bool = False, limit: int = 1000) -> list[dict]:
+        """Liked companies with their name, domain, sector and city."""
+        where = "WHERE l.searched_at IS NULL" if unsearched_only else ""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                    f"""SELECT l.*, c.name, c.domain, c.industry, c.location FROM brand_likes l
+                        JOIN companies c ON c.id = l.company_id {where}
+                        ORDER BY l.liked_at LIMIT ?""", (int(limit),)) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def mark_like_searched(self, company_id: str):
+        async with self._connect() as db:
+            await db.execute("UPDATE brand_likes SET searched_at = CURRENT_TIMESTAMP "
+                             "WHERE company_id = ?", (company_id,))
+            await db.commit()
 
     async def set_company_junk(self, verdicts: dict[str, tuple[str, str]]):
         """company id -> (reason, source); reason '' clears it. A company

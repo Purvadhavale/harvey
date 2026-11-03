@@ -15,6 +15,9 @@ results showed (all free signals), weighed against the ICP:
     funding           5          a funding round in the news
     LinkedIn page     5          an established company page
     priority city     5          located in icp.geography
+    like a liked one  10         same sector and 2+ of the same signals as a
+                                 brand the team liked, or found by searching
+                                 for brands like it (harvey.lookalikes)
 
 Junk companies (harvey.junk) and the do-not-contact list score 0. Every
 weight can be overridden under ``icp.brand_fit`` in the config.
@@ -42,6 +45,7 @@ DEFAULTS = {
     "funding": 5,
     "linkedin_page": 5,
     "priority_city": 5,
+    "similar_to_liked": 10,
 }
 STOREFRONTS = re.compile(r"shopify|woocommerce|magento|bigcommerce|dukaan|shopflo|gokwik", re.I)
 MARKETING_TITLE = re.compile(
@@ -56,6 +60,22 @@ def weights(config) -> dict:
     return {**DEFAULTS, **custom}
 
 
+def traits(observations: list[dict]) -> set[str]:
+    """The ad / storefront / social signals two brands can share."""
+    out = set()
+    if _latest_bool(observations, "RUNNING_META_ADS"):
+        out.add("meta")
+    if _latest_bool(observations, "RUNNING_GOOGLE_ADS"):
+        out.add("google")
+    if any((o.get("value_text") or "").lower().startswith("instagram:")
+           for o in observations if o.get("signal_code") == "SOCIAL_PROFILE"):
+        out.add("instagram")
+    if STOREFRONTS.search(" ".join(o.get("value_text") or "" for o in observations
+                                   if o.get("signal_code") == "TECH_STACK")):
+        out.add("d2c")
+    return out
+
+
 def _latest_bool(observations: list[dict], code: str) -> bool | None:
     rows = sorted((o for o in observations if o.get("signal_code") == code),
                   key=lambda o: o.get("observed_at") or "")
@@ -65,8 +85,11 @@ def _latest_bool(observations: list[dict], code: str) -> bool | None:
 
 
 def brand_fit(company: dict, prospects: list[dict], observations: list[dict],
-              config, dnc: list[str] | None = None) -> tuple[int, list[str]]:
-    """(score, reasons) for one company. Reasons read like "+30 running Meta ads"."""
+              config, dnc: list[str] | None = None,
+              liked: list[dict] | None = None) -> tuple[int, list[str]]:
+    """(score, reasons) for one company. Reasons read like "+30 running Meta ads".
+
+    ``liked``: the team's liked brands, each {"id", "name", "industry", "traits"}."""
     icp = config.icp
     w = weights(config)
     if dnc is None:
@@ -128,6 +151,19 @@ def brand_fit(company: dict, prospects: list[dict], observations: list[dict],
     city = (company.get("location") or "").strip().lower()
     if city and city in {g.strip().lower() for g in (icp.geography or [])}:
         add(w["priority_city"], f"priority city: {company['location']}")
+
+    if company.get("source") == "lookalike":
+        note = company.get("notes") or "Similar to a liked brand"
+        add(w["similar_to_liked"], note[:1].lower() + note[1:] + " (liked)")
+    else:
+        mine = traits(observations)
+        twin = next((b for b in liked or [] if b["id"] != company.get("id")
+                     and (b.get("industry") or "").lower() == industry.lower()
+                     and len(mine & b["traits"]) >= 2), None)
+        if twin:
+            add(w["similar_to_liked"], f"like {twin['name']} (liked)")
+    if any(b["id"] == company.get("id") for b in liked or []):
+        reasons.append("liked by the team")
 
     if meta is None and not company.get("profile_checked_at"):
         reasons.append("website not read yet: score will change")

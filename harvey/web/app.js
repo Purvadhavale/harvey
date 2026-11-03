@@ -1350,7 +1350,8 @@ async function loadFind() {
   pend('leads-pending-li', s.linkedin_pending, 'brands not searched yet');
   pend('leads-pending-guess', es.guess || 0, 'guessed emails waiting');
   pend('leads-pending-invalid', es.invalid || 0, 'invalid emails');
-  ['discover', 'profile', 'team', 'linkedin', 'reverify', 'retry'].forEach(k => {
+  pend('leads-pending-like', s.likes_pending || 0, 'liked brands not searched yet');
+  ['discover', 'profile', 'team', 'linkedin', 'reverify', 'retry', 'lookalike'].forEach(k => {
     const b = document.getElementById('leads-btn-' + k);
     if (b) b.disabled = !!s.busy;
   });
@@ -1373,7 +1374,7 @@ function renderLeadsJob(s) {
   if (job.error) head += '<div class="test-result error" style="margin-top:8px">' + escHtml(job.error) + '</div>';
   if (job.result) {
     const r = job.result;
-    head += '<div class="qdetail" style="margin-top:6px">' + (r.contacts_added !== undefined
+    head += '<div class="qdetail" style="margin-top:6px">' + (r.lookalikes ? escHtml(r.lookalikes) : r.contacts_added !== undefined
       ? r.contacts_added + ' new contact(s)'
       : Object.entries(r.email_status || {}).map(([k, v]) => v + ' ' + k).join(' · ') || 'nothing to re-check') + '</div>' +
       (r.crm_sync ? '<div class="cell-sub">' + escHtml(r.crm_sync) + '</div>' : '');

@@ -75,6 +75,17 @@ def next_step(contacts: list[dict], signals: dict, phone_type: str, titles: list
     return "Find a contact manually"
 
 
+def found_via(company: dict) -> str:
+    """Where Harvey found a brand, in a few words."""
+    source = company.get("source") or ""
+    if source == "lookalike":
+        return (company.get("notes") or "Similar to a liked brand") + " (liked)"
+    if source.startswith("discover:"):
+        what = " ".join(x for x in (company.get("industry"), company.get("location")) if x)
+        return f"Google search: {what}" if what else "Google search"
+    return source
+
+
 async def build_rows(state, config) -> tuple[list[dict], list[dict]]:
     """(brands, contacts) rows for the two Supabase tables."""
     import aiosqlite
@@ -143,6 +154,7 @@ async def build_rows(state, config) -> tuple[list[dict], list[dict]]:
             "tech_stack": sig["tech_stack"],
             "hiring_roles": sig["hiring_roles"][:500],
             "funding_round": sig["funding_round"],
+            "found_via": found_via(c),
             "first_found_at": _ts(c.get("created_at")),
             "synced_at": now,
         })
@@ -202,27 +214,34 @@ async def push(brands: list[dict], contacts: list[dict], url: str, key: str,
     return len(brands), len(contacts)
 
 
+async def _get(client, url: str, key: str, path: str) -> list[dict]:
+    r = await client.get(f"{url.rstrip('/')}/rest/v1/{path}",
+                         headers={"apikey": key, "Authorization": f"Bearer {key}"})
+    if r.status_code >= 300:
+        raise RuntimeError(f"Supabase read failed: HTTP {r.status_code} {r.text[:300]}")
+    return r.json()
+
+
 async def pull_tags(state, url: str, key: str, client=None) -> int:
-    """Copy the team's junk / real-brand tags from the CRM into Harvey."""
+    """Copy the team's junk / real-brand tags and likes from the CRM into Harvey."""
     import aiosqlite
     import httpx
 
-    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
-    endpoint = (f"{url.rstrip('/')}/rest/v1/crm_brands"
-                "?select=brand_id,junk,junk_reason,junk_by,junk_at&junk=not.is.null")
     own = client is None
     client = client or httpx.AsyncClient(timeout=30)
     try:
-        r = await client.get(endpoint, headers=headers)
-        if r.status_code >= 300:
-            raise RuntimeError(f"Supabase tags read failed: HTTP {r.status_code} {r.text[:300]}")
-        rows = r.json()
+        rows = await _get(client, url, key,
+                          "crm_brands?select=brand_id,junk,junk_reason,junk_by,junk_at&junk=not.is.null")
+        async with aiosqlite.connect(state.db_path) as db:
+            async with db.execute("SELECT id, name, domain FROM companies") as cur:
+                known = {i: (n or "", d or "") for i, n, d in await cur.fetchall()}
+        likes = await _get(client, url, key,
+                           "crm_brands?select=brand_id,liked_by,liked_at&liked=is.true")
     finally:
         if own:
             await client.aclose()
-    async with aiosqlite.connect(state.db_path) as db:
-        async with db.execute("SELECT id, name, domain FROM companies") as cur:
-            known = {i: (n or "", d or "") for i, n, d in await cur.fetchall()}
+    await state.save_brand_likes([{"company_id": t["brand_id"], "liked_by": t.get("liked_by") or "",
+                                   "liked_at": t.get("liked_at")} for t in likes if t.get("brand_id") in known])
     tags = [{"company_id": t["brand_id"], "name": known[t["brand_id"]][0],
              "domain": known[t["brand_id"]][1], "junk": 1 if t["junk"] else 0,
              "reason": t.get("junk_reason") or "", "tagged_by": t.get("junk_by") or "",
@@ -255,20 +274,47 @@ async def auto_sync(state, config=None) -> str:
         if config is None:
             from harvey.config import load_config
             config = load_config()
-        brands, contacts = await sync(state, config)
-        return f"Synced to CRM: {brands} brands, {contacts} contacts"
+        notes = []
+
+        async def likes():
+            notes.append(await search_likes(state, config))
+        brands, contacts = await sync(state, config, after_pull=likes)
+        extra = next((n for n in notes if n), "")
+        return f"Synced to CRM: {brands} brands, {contacts} contacts" + (f". {extra}" if extra else "")
     except Exception as e:
         logger.warning(f"CRM sync failed: {e}")
         return f"CRM sync failed: {e}"
 
 
-async def sync(state, config) -> tuple[int, int]:
-    """Read the team's junk tags, re-judge every company, then build the
-    rows and push them. Returns (brands, contacts) sent."""
+async def search_likes(state, config) -> str:
+    """Brands liked since the last run: search for look-alikes and read the
+    new sites, so they arrive in the CRM scored. "" when there was nothing."""
+    from harvey import lookalikes
+    from harvey.config import load_env
+
+    if not await state.brand_likes(unsearched_only=True, limit=1):
+        return ""
+    api_key = getattr(load_env(), "serper_api_key", "") or ""
+    if not api_key:
+        return "Liked brands waiting: add SERPER_API_KEY to search for look-alikes"
+    counts = await lookalikes.find_lookalikes(state, config, api_key)
+    if counts["added_ids"]:
+        from harvey.pipeline import run_profile_stage
+        await run_profile_stage(state, limit=len(counts["added_ids"]) + 50, config=config)
+    return lookalikes.summary(counts)
+
+
+async def sync(state, config, after_pull=None) -> tuple[int, int]:
+    """Read the team's junk tags and likes, re-judge every company, then
+    build the rows and push them. Returns (brands, contacts) sent.
+    ``after_pull``: an async callable run once the tags and likes are in
+    (auto_sync searches for look-alikes there)."""
     from harvey import junk
 
     url, key = credentials()
     await pull_tags(state, url, key)
+    if after_pull:
+        await after_pull()
     logger.info(junk.summary(await junk.apply(state)))
     brands, contacts = await build_rows(state, config)
     counts = await push(brands, contacts, url, key)

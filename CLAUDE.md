@@ -335,6 +335,8 @@ harvey export                # Deliverable prospects → sequencer-ready CSV (pr
 harvey export --supabase     # ...and upsert the rows to Supabase (table from docs/supabase_leads.sql)
 harvey leads [--known-only]  # Scout only: decision-makers + verified emails; never writes or sends
 harvey reverify              # Re-check 'guess' emails (monthly, after free verifier credits reset)
+harvey sync                  # CRM (Supabase): pull junk tags + likes, re-judge junk, push brands + contacts
+harvey lookalikes            # Brands like the ones liked in the CRM (harvey/lookalikes.py), read + synced
 harvey export --all          # Full raw list, no filters
 harvey companies             # Company register CSV: every company, its fit score, and why it wasn't contacted
 harvey gmail auth            # One-time Gmail OAuth (when provider: gmail)
