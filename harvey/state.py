@@ -536,6 +536,24 @@ MIGRATIONS: list[str] = [
     -- backfill rotates back round.
     ALTER TABLE companies ADD COLUMN people_searched_at TIMESTAMP DEFAULT NULL;
     """,
+    # ── v17: junk brands (not a buyer) and the team's tags that teach it ──
+    """
+    -- junk: why this isn't a brand worth contacting ('' = it is one).
+    -- junk_source: 'team' (tagged in the CRM), 'rule' (built-in pattern) or
+    -- 'learned' (looks like brands the team tagged). Junk companies are
+    -- skipped by every lookup that costs a search or a site visit.
+    ALTER TABLE companies ADD COLUMN junk TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN junk_source TEXT DEFAULT '';
+    CREATE TABLE IF NOT EXISTS brand_tags (
+        company_id TEXT PRIMARY KEY,
+        domain TEXT DEFAULT '',
+        name TEXT DEFAULT '',
+        junk INTEGER NOT NULL,
+        reason TEXT DEFAULT '',
+        tagged_by TEXT DEFAULT '',
+        tagged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -1908,7 +1926,7 @@ class StateManager:
                 f"""SELECT c.id, c.name, c.domain
                    FROM companies c
                    {_LAST_PROFILED_JOIN}
-                   WHERE c.domain != ''
+                   WHERE c.domain != '' AND COALESCE(c.junk, '') = ''
                      AND ({_LAST_PROFILED} IS NULL
                           OR {_LAST_PROFILED} < datetime('now', ?))
                    ORDER BY {_LAST_PROFILED} IS NOT NULL, {_LAST_PROFILED}
@@ -1922,7 +1940,7 @@ class StateManager:
             async with db.execute(
                 f"""SELECT COUNT(*) FROM companies c
                    {_LAST_PROFILED_JOIN}
-                   WHERE c.domain != ''
+                   WHERE c.domain != '' AND COALESCE(c.junk, '') = ''
                      AND ({_LAST_PROFILED} IS NULL
                           OR {_LAST_PROFILED} < datetime('now', ?))""",
                 (f"-{int(stale_days)} days",),
@@ -1949,6 +1967,7 @@ class StateManager:
             async with db.execute(
                 """SELECT id, name, domain, industry FROM companies
                    WHERE domain != '' AND people_searched_at IS NULL
+                     AND COALESCE(junk, '') = ''
                    ORDER BY created_at LIMIT ?""",
                 (limit,),
             ) as cursor:
@@ -2010,7 +2029,7 @@ class StateManager:
                 """SELECT c.id, c.name, c.domain, c.industry
                    FROM companies c
                    LEFT JOIN prospects p ON p.company_id = c.id
-                   WHERE c.domain != ''
+                   WHERE c.domain != '' AND COALESCE(c.junk, '') = ''
                      AND (c.prospects_checked_at IS NULL
                           OR c.prospects_checked_at < datetime('now', ?))
                    GROUP BY c.id
@@ -2020,6 +2039,46 @@ class StateManager:
                 (f"-{int(stale_days)} days", int(limit)),
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
+
+    async def save_brand_tags(self, tags: list[dict]) -> int:
+        """Store the team's junk / not-junk verdicts: the full current set,
+        so a tag cleared in the CRM goes here too."""
+        async with self._connect() as db:
+            await db.execute("DELETE FROM brand_tags")
+            await db.executemany(
+                """INSERT INTO brand_tags (company_id, domain, name, junk, reason, tagged_by, tagged_at)
+                   VALUES (:company_id, :domain, :name, :junk, :reason, :tagged_by,
+                           COALESCE(:tagged_at, CURRENT_TIMESTAMP))
+                   ON CONFLICT(company_id) DO UPDATE SET junk = excluded.junk,
+                       reason = excluded.reason, tagged_by = excluded.tagged_by,
+                       tagged_at = excluded.tagged_at""",
+                [{"domain": "", "name": "", "reason": "", "tagged_by": "", "tagged_at": None, **t}
+                 for t in tags],
+            )
+            await db.commit()
+        return len(tags)
+
+    async def brand_tags(self) -> list[dict]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM brand_tags") as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def set_company_junk(self, verdicts: dict[str, tuple[str, str]]):
+        """company id -> (reason, source); reason '' clears it. A company
+        that stops being junk gets its skipped lookups back."""
+        async with self._connect() as db:
+            for cid, (reason, source) in verdicts.items():
+                if reason:
+                    await db.execute(
+                        "UPDATE companies SET junk = ?, junk_source = ? WHERE id = ?",
+                        (reason, source, cid))
+                else:
+                    await db.execute(
+                        """UPDATE companies SET junk = '', junk_source = '',
+                               people_searched_at = NULL, prospects_checked_at = NULL
+                           WHERE id = ? AND COALESCE(junk, '') != ''""", (cid,))
+            await db.commit()
 
     async def mark_prospects_checked(self, company_id: str):
         """Record that a prospect-backfill pass looked at this company,

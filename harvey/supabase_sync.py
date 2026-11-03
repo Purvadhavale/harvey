@@ -113,6 +113,9 @@ async def build_rows(state, config) -> tuple[list[dict], list[dict]]:
         phone_type = c.get("phone_type") or ""
         reg = fit.get(c["id"], {})
         people = by_company.get(c["id"], [])
+        junk, junk_source = c.get("junk") or "", c.get("junk_source") or ""
+        if not junk and do_not_contact_domain_match(c["domain"], dnc):
+            junk, junk_source = "On the do-not-contact list", "rule"
         brands.append({
             "id": c["id"],
             "name": c.get("name") or c["domain"],
@@ -121,10 +124,12 @@ async def build_rows(state, config) -> tuple[list[dict], list[dict]]:
             "website": f"https://{c['domain']}",
             "sector": _sector(c.get("industry")),
             "city": c.get("location") or "",
-            "is_junk": bool(do_not_contact_domain_match(c["domain"], dnc)),
+            "is_junk": bool(junk),
+            "junk_reason": junk,
+            "junk_source": junk_source,
             "fit": int(reg.get("fit") or 0),
             "fit_reasons": " · ".join(reg.get("fit_reasons") or []),
-            "next_step": next_step(people, sig, phone_type, titles),
+            "next_step": "Skip: " + junk if junk else next_step(people, sig, phone_type, titles),
             "phone": (c.get("phone") or "") if phone_type else "",
             "phone_type": phone_type,
             "phone_source": (c.get("phone_source") or "") if phone_type else "",
@@ -195,6 +200,35 @@ async def push(brands: list[dict], contacts: list[dict], url: str, key: str,
     return len(brands), len(contacts)
 
 
+async def pull_tags(state, url: str, key: str, client=None) -> int:
+    """Copy the team's junk / real-brand tags from the CRM into Harvey."""
+    import aiosqlite
+    import httpx
+
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    endpoint = (f"{url.rstrip('/')}/rest/v1/crm_brands"
+                "?select=brand_id,junk,junk_reason,junk_by,junk_at&junk=not.is.null")
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=30)
+    try:
+        r = await client.get(endpoint, headers=headers)
+        if r.status_code >= 300:
+            raise RuntimeError(f"Supabase tags read failed: HTTP {r.status_code} {r.text[:300]}")
+        rows = r.json()
+    finally:
+        if own:
+            await client.aclose()
+    async with aiosqlite.connect(state.db_path) as db:
+        async with db.execute("SELECT id, name, domain FROM companies") as cur:
+            known = {i: (n or "", d or "") for i, n, d in await cur.fetchall()}
+    tags = [{"company_id": t["brand_id"], "name": known[t["brand_id"]][0],
+             "domain": known[t["brand_id"]][1], "junk": 1 if t["junk"] else 0,
+             "reason": t.get("junk_reason") or "", "tagged_by": t.get("junk_by") or "",
+             "tagged_at": t.get("junk_at")}
+            for t in rows if t.get("brand_id") in known]
+    return await state.save_brand_tags(tags)
+
+
 def configured() -> bool:
     """Are SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY set?"""
     try:
@@ -209,6 +243,11 @@ async def auto_sync(state, config=None) -> str:
     failed sync must not fail the step that found the leads. Returns a
     one-line outcome for the log or the page."""
     if not configured():
+        try:        # junk rules still apply without the CRM
+            from harvey import junk
+            await junk.apply(state)
+        except Exception as e:
+            logger.warning(f"Junk check failed: {e}")
         return "CRM sync skipped: add SUPABASE_SERVICE_ROLE_KEY to .env to sync automatically"
     try:
         if config is None:
@@ -222,8 +261,13 @@ async def auto_sync(state, config=None) -> str:
 
 
 async def sync(state, config) -> tuple[int, int]:
-    """Build the rows and push them. Returns (brands, contacts) sent."""
+    """Read the team's junk tags, re-judge every company, then build the
+    rows and push them. Returns (brands, contacts) sent."""
+    from harvey import junk
+
     url, key = credentials()
+    await pull_tags(state, url, key)
+    logger.info(junk.summary(await junk.apply(state)))
     brands, contacts = await build_rows(state, config)
     counts = await push(brands, contacts, url, key)
     logger.info(f"Synced {counts[0]} brands and {counts[1]} contacts to Supabase")
