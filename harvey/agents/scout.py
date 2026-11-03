@@ -38,6 +38,7 @@ from bs4 import BeautifulSoup
 
 from harvey.brain import Brain
 from harvey.collectors import people as people_mod
+from harvey.collectors import linkedin_search as li_search
 from harvey.collectors.discover import site_name_from_html
 from harvey.collectors.profile import _reads_like_title, looks_like_challenge
 from harvey.config import HarveyConfig, EnvConfig
@@ -56,6 +57,11 @@ logger = logging.getLogger("harvey.scout")
 
 # Max queries per cycle to avoid rate limits
 MAX_QUERIES_PER_CYCLE = 3
+# The people search is its own budget: one query per company, and it runs
+# on companies already found, so it doesn't compete with finding new ones.
+MAX_PEOPLE_SEARCHES_PER_CYCLE = 10
+MAX_PEOPLE_PER_COMPANY = 2      # best-ranked: email found and checked
+MAX_TEAM_PROFILES = 6           # the rest of the marketing team: LinkedIn only, no credits
 # Delay between search requests (seconds)
 SEARCH_DELAY = (2, 5)
 
@@ -128,6 +134,12 @@ _SENIOR_KEYWORDS = (
 )
 
 
+def _search_country(scout) -> str:
+    """icp.search_country (Serper's "gl"), or "" for Serper's US default."""
+    icp = getattr(getattr(scout, "config", None), "icp", None)
+    return getattr(icp, "search_country", "") or ""
+
+
 class Scout:
     def __init__(
         self,
@@ -152,8 +164,13 @@ class Scout:
         self._own_domains: dict[str, bool] = {}
         self._challenged: set[str] = set()
 
-    async def run(self):
-        """Main prospecting flow: find leads matching ICP."""
+    async def run(self, only: set[str] | None = None) -> int:
+        """Main prospecting flow: find leads matching ICP.
+
+        ``only`` limits the cycle to those strategy names (``harvey leads
+        --known-only`` runs just the backfill of discovered companies).
+        Returns how many prospects were added.
+        """
         logger.info("Scout: Starting prospecting cycle...")
 
         self.skills = self.brain.load_skills_for_agent("scout")
@@ -178,6 +195,9 @@ class Scout:
         # the mercy of Serper/Bing flakiness — cheapest, most reliable win
         # available before spending any queries.
         strategies.append(("known_companies", self._prospect_via_known_companies))
+        # Named marketing people at those companies, from Google's index of
+        # public LinkedIn profiles (never LinkedIn itself). Serper only.
+        strategies.append(("people_search", self._prospect_via_people_search))
         if self.config.channels.linkedin.enabled and self.env.linkedin_email:
             strategies.append(("linkedin", self._prospect_via_linkedin))
         # Job boards first: hiring is the strongest intent signal, and the
@@ -191,6 +211,9 @@ class Scout:
             strategies.append(("profile_search", self._prospect_via_profile_search))
         strategies.append(("company_discovery", self._prospect_via_company_discovery))
 
+        if only is not None:
+            strategies = [(name, s) for name, s in strategies if name in only]
+
         for name, strategy in strategies:
             try:
                 prospects_found += await strategy()
@@ -203,6 +226,7 @@ class Scout:
             details={"prospects_found": prospects_found},
         )
         logger.info(f"Scout: Found {prospects_found} new prospects this cycle.")
+        return prospects_found
 
     # ── Prospect dedup helpers ──
 
@@ -412,7 +436,8 @@ class Scout:
         resp = await self._fetch(
             "https://google.serper.dev/search",
             method="POST",
-            json_body={"q": query, "num": min(MAX_RESULTS_PER_QUERY, SERPER_MAX_NUM)},
+            json_body={"q": query, "num": min(MAX_RESULTS_PER_QUERY, SERPER_MAX_NUM),
+                       **({"gl": gl} if (gl := _search_country(self)) else {})},
             headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
             retries=2,
         )
@@ -864,6 +889,96 @@ class Scout:
                 if count >= 15:
                     return count
 
+        return count
+
+    async def _search_serper_items(self, query: str, api_key: str) -> list[dict]:
+        """Serper's raw organic results (title, link, snippet): the people
+        search needs the result title, which _search_serper drops."""
+        resp = await self._fetch(
+            "https://google.serper.dev/search",
+            method="POST",
+            json_body={"q": query, "num": SERPER_MAX_NUM,
+                       **({"gl": gl} if (gl := _search_country(self)) else {})},
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            retries=2,
+        )
+        if resp is None:
+            return []
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            return []
+        items = data.get("organic") if isinstance(data, dict) else None
+        return [i for i in items or [] if isinstance(i, dict)]
+
+    async def _prospect_via_people_search(self) -> int:
+        """Marketing decision-makers at known companies, by name, from a
+        Google search of public LinkedIn profiles; then their work email.
+
+        One query per company, once per company. Results must tie the person
+        to the brand (current company or Experience naming it), and are
+        ranked by icp.titles so the best buyers come first.
+        """
+        api_key = getattr(self.env, "serper_api_key", "") or ""
+        if not api_key:
+            return 0
+        from harvey.config import live_do_not_contact
+        from harvey.gate import do_not_contact_domain_match
+        try:
+            blocked = live_do_not_contact(self.config)
+        except Exception:
+            blocked = []
+        companies = await self.state.companies_for_people_search(limit=MAX_PEOPLE_SEARCHES_PER_CYCLE)
+        if not companies:
+            return 0
+        logger.info(f"Scout: Searching LinkedIn profiles for {len(companies)} companies...")
+        priorities = list(self.config.icp.titles or [])
+        count = 0
+        for company in companies:
+            domain = (company.get("domain") or "").strip()
+            name = (company.get("name") or "").strip() or self._domain_to_name(domain)
+            if do_not_contact_domain_match(domain, blocked):
+                await self.state.mark_people_searched(company["id"])
+                continue
+            tokens = li_search.brand_tokens(name, domain)
+            items = await self._search_serper_items(li_search.search_query(name), api_key)
+            await self.state.mark_people_searched(company["id"])
+            ranked = []
+            for item in items:
+                snippet = item.get("snippet", "") or ""
+                person = li_search.parse_result(item.get("title", ""), snippet, item.get("link", ""))
+                if not person or not li_search.works_at(person, snippet, tokens):
+                    continue
+                if li_search.outside_country(snippet, _search_country(self), item.get("link", "")):
+                    continue        # same brand name, another country's staff
+                rank = li_search.title_rank(person["title"], priorities)
+                if rank is not None:
+                    ranked.append((rank, person))
+            ranked.sort(key=lambda rp: rp[0])
+            for i, (_, person) in enumerate(ranked[:MAX_TEAM_PROFILES]):
+                with_email = i < MAX_PEOPLE_PER_COMPANY
+                prospect = Prospect(
+                    company_id=company["id"], company=name,
+                    first_name=person["first_name"], last_name=person["last_name"],
+                    title=person["title"], linkedin_url=person["linkedin_url"],
+                    seniority=self._infer_seniority(person["title"]),
+                    industry=company.get("industry") or "",
+                    source="linkedin_search" if with_email else "linkedin_team",
+                    source_url=person["linkedin_url"],
+                )
+                if not prospect.is_valid() or await self._is_duplicate_prospect(prospect):
+                    continue
+                status = "not checked"
+                if with_email:
+                    email, status = await self._resolve_email(
+                        prospect.first_name, prospect.last_name.split()[-1], domain)
+                    prospect.email, prospect.email_status = email, status
+                    prospect.email_verified = status == "verified"
+                await self.state.add_prospect(prospect)
+                self._remember_prospect(prospect)
+                count += 1
+                logger.info(f"Scout: Added {prospect.full_name()} ({prospect.title}) "
+                            f"at {name} [linkedin search, email {status}]")
         return count
 
     # ── Strategy 3: Find companies, then scrape team pages ──

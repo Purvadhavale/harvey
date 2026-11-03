@@ -175,7 +175,7 @@ Ask the user these questions and build `harvey.yaml` and `skills/product_knowled
 
 ### Step 4: Confirm Signals
 
-Harvey ships a catalog of 29 signals it knows how to collect, all **proposed** and
+Harvey ships a catalog of 30 signals it knows how to collect, all **proposed** and
 none active. Nothing is prospected against until the user confirms them.
 
 Send them to `harvey dashboard` → **Signals**, where each one shows a
@@ -332,6 +332,9 @@ harvey train <url>           # Train on a product website
 harvey status                # Pipeline summary
 harvey usage                 # Claude quota gauges + per-agent token usage (no dollar costs — subscription plans aren't billed per token)
 harvey export                # Deliverable prospects → sequencer-ready CSV (prospects.csv)
+harvey export --supabase     # ...and upsert the rows to Supabase (table from docs/supabase_leads.sql)
+harvey leads [--known-only]  # Scout only: decision-makers + verified emails; never writes or sends
+harvey reverify              # Re-check 'guess' emails (monthly, after free verifier credits reset)
 harvey export --all          # Full raw list, no filters
 harvey companies             # Company register CSV: every company, its fit score, and why it wasn't contacted
 harvey gmail auth            # One-time Gmail OAuth (when provider: gmail)

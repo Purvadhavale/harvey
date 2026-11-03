@@ -384,6 +384,7 @@ class DiscoveryQuery:
     depth: int = 30                  # SERP depth; ignored by listings providers
     limit: int = 100                 # max records to take from one query
     preset: str = ""                 # PRESETS key that built it, if any
+    country: str = ""                # Google "gl" code ("in"); "" = US default
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
@@ -829,7 +830,8 @@ class Serper(DiscoveryProvider):
                      "Content-Type": "application/json"},
             # Free accounts reject num > 10 (HTTP 400 "Query pattern not
             # allowed for free accounts"), verified 2026-10-26.
-            json={"q": query.keyword(), "num": max(1, min(query.depth, 10))},
+            json={"q": query.keyword(), "num": max(1, min(query.depth, 10)),
+                  **({"gl": query.country} if query.country else {})},
         )
         r.raise_for_status()
         data = r.json()
@@ -1677,10 +1679,12 @@ def build_queries(config, cities: list[str] | None = None,
             v.strip() for t in terms for v in [t, *variants.get(t, [])] if v.strip()))
         places = cities if cities is not None else list(icp.geography) or [""]
     coords = getattr(icp, "geo_coordinates", {}) or {}
+    country = getattr(icp, "search_country", "") or ""
 
     return [
         DiscoveryQuery(term=term, location=place, depth=depth, limit=limit,
-                       coordinate=coords.get(place, ""), preset=preset if spec else "")
+                       coordinate=coords.get(place, ""), preset=preset if spec else "",
+                       country=country)
         for term in terms
         for place in places
     ]

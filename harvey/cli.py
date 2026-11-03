@@ -440,6 +440,11 @@ def cmd_export(args):
             statuses=statuses,
             include_all=args.all,
         )
+        if args.supabase:
+            from harvey.config import load_config
+            from harvey.supabase_sync import sync
+            brands, contacts = await sync(state, load_config())
+            print(f"\n  Synced {brands} brands and {contacts} contacts to Supabase")
         scope = "all prospects" if args.all else (
             f"email status {email_statuses or ['verified', 'risky']}"
             + (f", score >= {args.min_score}" if args.min_score else "")
@@ -578,6 +583,97 @@ def cmd_profile(args):
         print("\n  See what turned up: harvey dashboard → Signals\n")
 
     asyncio.run(_profile())
+
+
+def cmd_sync(args):
+    """Copy the lead list (brands + contacts) to Supabase."""
+    from harvey.config import load_config
+    from harvey.state import StateManager
+    from harvey.supabase_sync import sync
+
+    async def _sync():
+        state = StateManager()
+        await state.init_db()
+        brands, contacts = await sync(state, load_config())
+        print(f"\n  Synced {brands} brands and {contacts} contacts to Supabase.\n")
+
+    asyncio.run(_sync())
+
+
+def cmd_leads(args):
+    """Find decision-makers and verified emails: Scout only. Never writes or
+    sends an email, whatever the sending settings say."""
+    from harvey.agents.scout import Scout
+    from harvey.brain import Brain
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+
+    async def _leads():
+        config = load_config()
+        state = StateManager()
+        await state.init_db()
+        scout = Scout(Brain(state, config.brain), state, config, load_env())
+        only = None
+        if args.known_only or args.linkedin:
+            only = set()
+            if args.known_only:
+                only.add("known_companies")
+            if args.linkedin:
+                only.add("people_search")
+        total = 0
+        for cycle in range(1, args.cycles + 1):
+            found = await scout.run(only=only)
+            total += found
+            print(f"  Cycle {cycle}: {found} new contact(s)")
+            if found == 0:
+                break
+        counts = await state.count_prospects_by_email_status()
+        print(f"\n  Added {total} contact(s). Email status across all contacts:")
+        for status in ("verified", "risky", "guess", "invalid", "none"):
+            if counts.get(status):
+                print(f"    {status:<10} {counts[status]}")
+        print("\n  Retry guesses after credits reset: harvey reverify")
+        print("  Export: harvey export\n")
+
+    asyncio.run(_leads())
+
+
+def cmd_reverify(args):
+    """Re-check "guess" emails through the verifiers. Run monthly, after the
+    free credits reset."""
+    from harvey.config import load_env
+    from harvey.integrations.email_finder import retry_invalid_named, reverify_guesses
+    from harvey.state import StateManager
+
+    async def _reverify():
+        state = StateManager()
+        await state.init_db()
+        env = load_env()
+        if not (env.reoon_api_key or env.zerobounce_api_key or env.hunter_api_key):
+            print("\n  No verifier key in .env (REOON_API_KEY, ZEROBOUNCE_API_KEY or "
+                  "HUNTER_API_KEY): nothing can be re-checked.\n")
+            return
+        if args.invalid:
+            print("\n  Trying other email formats for named people marked invalid...")
+            counts = await retry_invalid_named(state, env, limit=args.limit)
+            for status in ("verified", "risky", "invalid"):
+                if counts.get(status):
+                    print(f"    {status:<10} {counts[status]}")
+            print()
+            return
+        waiting = len(await state.prospects_with_email_status("guess", limit=args.limit))
+        if not waiting:
+            print("\n  No guessed emails to re-check.\n")
+            return
+        print(f"\n  Re-checking {waiting} guessed email(s)...")
+        counts = await reverify_guesses(state, env, limit=args.limit)
+        for status in ("verified", "risky", "invalid", "guess"):
+            if counts.get(status):
+                note = "  (still undecided)" if status == "guess" else ""
+                print(f"    {status:<10} {counts[status]}{note}")
+        print()
+
+    asyncio.run(_reverify())
 
 
 def cmd_discover(args):
@@ -1046,7 +1142,14 @@ def main():
     sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
     sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued); opted-out contacts stay excluded")
     sub.add_argument("--all", action="store_true", help="Export the raw list without filters, including opted-out contacts (not for outreach)")
+    sub.add_argument("--supabase", action="store_true",
+                     help="Also sync every brand and contact to Supabase "
+                          "(SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY in .env)")
     sub.set_defaults(func=cmd_export)
+
+    sub = subparsers.add_parser(
+        "sync", help="Copy all brands and contacts to Supabase (tables: brands, contacts)")
+    sub.set_defaults(func=cmd_sync)
 
     # harvey companies
     sub = subparsers.add_parser(
@@ -1111,6 +1214,26 @@ def main():
     sub.add_argument("--stale-days", type=int, default=90,
                      help="Re-read a site after this many days (default: 90)")
     sub.set_defaults(func=cmd_profile)
+
+    sub = subparsers.add_parser(
+        "leads", help="Find decision-makers and verified emails (Scout only; never writes or sends)")
+    sub.add_argument("--known-only", action="store_true",
+                     help="Only read team pages of companies already discovered (no searches)")
+    sub.add_argument("--linkedin", action="store_true",
+                     help="Find marketing people at discovered companies via Google's index of "
+                          "LinkedIn profiles (1 Serper search per company; never logs into LinkedIn)")
+    sub.add_argument("--cycles", type=int, default=1,
+                     help="Scout cycles to run, stopping early when one finds nothing (default: 1)")
+    sub.set_defaults(func=cmd_leads)
+
+    sub = subparsers.add_parser(
+        "reverify", help="Re-check guessed emails (monthly, after free verifier credits reset)")
+    sub.add_argument("--limit", type=int, default=100,
+                     help="Max emails to re-check, oldest first (default: 100)")
+    sub.add_argument("--invalid", action="store_true",
+                     help="Instead, try other email formats for named people marked invalid "
+                          "(up to 2 checks each)")
+    sub.set_defaults(func=cmd_reverify)
 
     sub = subparsers.add_parser(
         "signals", help="Review/confirm which signals Harvey prospects against")

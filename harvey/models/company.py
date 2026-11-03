@@ -20,6 +20,8 @@ class Company(BaseModel):
     company_size: str = ""
     location: str = ""
     phone: str = ""
+    phone_type: str = ""      # mobile | landline | toll_free | ... ('' = not validated)
+    phone_source: str = ""    # listing | website
     source: str = ""          # how we found them: google_dork, linkedin, company_scrape
     source_url: str = ""      # specific URL where we found the info
     # Provider-stable identity ("dataforseo:ChIJ...", "osm:node/123"). The

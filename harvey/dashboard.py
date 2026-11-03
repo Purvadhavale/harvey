@@ -2578,6 +2578,219 @@ async def export_cohort(require: str = "", exclude: str = "", ranges: str = ""):
     )
 
 
+# ── Lead generator: run each step by hand and watch it ──
+
+_leads_task: asyncio.Task | None = None
+_leads_job: dict = {}          # kind, started, finished, result, error, log
+LEADS_LOG_LINES = 200
+LEADS_STEPS = {
+    "team": "Read team pages for named people",
+    "linkedin": "Find marketing people via LinkedIn search",
+    "reverify": "Re-check guessed emails",
+    "retry": "Try other email formats for invalid ones",
+}
+
+
+class _JobLog(logging.Handler):
+    """Keeps the running job's harvey.* log lines for the page to show."""
+
+    def emit(self, record):
+        lines = _leads_job.setdefault("log", [])
+        lines.append(f"{datetime.now().strftime('%H:%M:%S')}  {record.getMessage()}")
+        del lines[:-LEADS_LOG_LINES]
+
+
+def _busy() -> str:
+    if _leads_task and not _leads_task.done():
+        return LEADS_STEPS.get(_leads_job.get("kind", ""), "a lead step")
+    if _discovery_task and not _discovery_task.done():
+        return "finding brands" if _discovery_kind == "discover" else "reading websites"
+    return ""
+
+
+@app.get("/api/leads/status")
+async def get_leads_status():
+    """Counts for every lead step, and the job running now."""
+    try:
+        from harvey.config import live_do_not_contact, load_config
+        from harvey.gate import do_not_contact_domain_match
+
+        state = _state()
+        await state.init_db()
+        try:
+            blocked = live_do_not_contact(load_config())
+        except Exception:
+            blocked = []
+        rows = await query_db(
+            "SELECT domain, profile_checked_at, people_searched_at, prospects_checked_at, "
+            "phone_type FROM companies WHERE COALESCE(domain, '') != ''")
+        brands = [r for r in rows if not do_not_contact_domain_match(r["domain"], blocked)]
+        signal_counts = {r["signal_code"]: r["n"] for r in await query_db(
+            "SELECT signal_code, COUNT(DISTINCT company_id) AS n FROM observations "
+            "WHERE signal_code IN ('LINKEDIN_PAGE', 'MARKETING_EMAIL') GROUP BY signal_code")}
+        instagram = await _scalar(
+            "SELECT COUNT(DISTINCT company_id) FROM observations "
+            "WHERE signal_code = 'SOCIAL_PROFILE' AND value_text LIKE 'instagram:%'")
+        by_status = {r["s"]: r["n"] for r in await query_db(
+            "SELECT COALESCE(NULLIF(email_status, ''), 'none') AS s, COUNT(*) AS n "
+            "FROM prospects WHERE status IS NOT 'opted_out' GROUP BY s")}
+        discover_queries = 0
+        for run in await query_db("SELECT params_json FROM runs WHERE stage = 'discover' "
+                                  "AND provider = 'serper' AND status != 'failed'"):
+            try:
+                discover_queries += int(json.loads(run["params_json"] or "{}").get("queries") or 0)
+            except (ValueError, TypeError):
+                pass
+        people_searched = sum(1 for r in rows if r["people_searched_at"])
+        job = {k: v for k, v in _leads_job.items() if k != "log"}
+        job["running"] = bool(_leads_task and not _leads_task.done())
+        job["log"] = (_leads_job.get("log") or [])[-60:]
+        return {
+            "companies": len(rows),
+            "brands": len(brands),
+            "blocked": len(rows) - len(brands),
+            "websites_read": sum(1 for r in brands if r["profile_checked_at"]),
+            "websites_pending": sum(1 for r in brands if not r["profile_checked_at"]),
+            "team_pending": sum(1 for r in brands if not r["prospects_checked_at"]),
+            "linkedin_searched": people_searched,
+            "linkedin_pending": sum(1 for r in brands if not r["people_searched_at"]),
+            "phones": sum(1 for r in brands if r["phone_type"]),
+            "linkedin_pages": signal_counts.get("LINKEDIN_PAGE", 0),
+            "instagram": instagram,
+            "marketing_emails": signal_counts.get("MARKETING_EMAIL", 0),
+            "contacts": sum(by_status.values()),
+            "named_contacts": await _scalar(
+                "SELECT COUNT(*) FROM prospects WHERE first_name != '' AND status IS NOT 'opted_out'"),
+            "linkedin_profiles": await _scalar(
+                "SELECT COUNT(*) FROM prospects WHERE linkedin_url != ''"),
+            "email_status": by_status,
+            "serper_used": discover_queries + people_searched,
+            "busy": _busy(),
+            "job": job,
+        }
+    except Exception as e:
+        logger.exception("leads status failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/leads/run")
+async def start_leads_step(request: Request):
+    """Run one lead step in the background: team pages, LinkedIn search or
+    re-checking guesses. Never writes or sends an email."""
+    global _leads_task, _leads_job
+    busy = _busy()
+    if busy:
+        return JSONResponse({"success": False, "message": f"Already {busy}. Wait for it to finish."},
+                            status_code=409)
+    body = await request.json()
+    kind = body.get("step") or ""
+    if kind not in LEADS_STEPS:
+        return JSONResponse({"success": False, "message": f"unknown step {kind!r}"}, status_code=400)
+    cycles = max(1, min(int(body.get("cycles") or 3), 20))
+
+    async def _go():
+        handler = _JobLog(level=logging.INFO)
+        root = logging.getLogger("harvey")
+        old_level = root.level
+        root.addHandler(handler)
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
+        try:
+            from harvey.config import load_config, load_env
+            state = _state()
+            await state.init_db()
+            env = load_env()
+            if kind == "retry":
+                from harvey.integrations.email_finder import retry_invalid_named
+                counts = await retry_invalid_named(state, env, limit=int(body.get("limit") or 50))
+                _leads_job["result"] = {"email_status": counts}
+            elif kind == "reverify":
+                from harvey.integrations.email_finder import reverify_guesses
+                counts = await reverify_guesses(state, env, limit=int(body.get("limit") or 100))
+                _leads_job["result"] = {"email_status": counts}
+            else:
+                from harvey.agents.scout import Scout
+                from harvey.brain import Brain
+                config = load_config()
+                scout = Scout(Brain(state, config.brain), state, config, env)
+                only = {"known_companies"} if kind == "team" else {"people_search"}
+                total = 0
+                for _ in range(cycles):
+                    found = await scout.run(only=only)
+                    total += found
+                    if found == 0:
+                        break
+                _leads_job["result"] = {"contacts_added": total}
+        except Exception as exc:
+            logger.exception("lead step failed")
+            _leads_job["error"] = str(exc)
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+            _leads_job["finished"] = datetime.now(timezone.utc).isoformat()
+
+    _leads_job = {"kind": kind, "label": LEADS_STEPS[kind],
+                  "started": datetime.now(timezone.utc).isoformat(), "log": []}
+    _leads_task = asyncio.create_task(_go())
+    return {"success": True, "step": kind}
+
+
+@app.get("/api/leads/contacts")
+async def get_leads_contacts(limit: int = 300):
+    """Every contact with its company's phone and social details, newest first."""
+    try:
+        from harvey.export import collect_prospects
+        state = _state()
+        await state.init_db()
+        rows = await collect_prospects(state, email_statuses=[])
+        rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        return {"contacts": rows[:max(1, min(limit, 2000))], "total": len(rows)}
+    except Exception as e:
+        logger.exception("leads contacts failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/leads/brands")
+async def get_leads_brands():
+    """Every brand (minus do-not-contact) with its phone, key signals (ads,
+    funding, hiring, socials) and the people found there."""
+    try:
+        import aiosqlite
+
+        from harvey.config import live_do_not_contact, load_config
+        from harvey.export import _key_signals
+        from harvey.gate import do_not_contact_domain_match
+
+        state = _state()
+        await state.init_db()
+        try:
+            blocked = live_do_not_contact(load_config())
+        except Exception:
+            blocked = []
+        companies = [c for c in await query_db(
+            "SELECT id, name, domain, website, description, industry, location, phone, "
+            "phone_type, phone_source, profile_checked_at, people_searched_at, created_at "
+            "FROM companies WHERE COALESCE(domain, '') != '' ORDER BY created_at DESC")
+            if not do_not_contact_domain_match(c["domain"], blocked)]
+        people: dict[str, list] = {}
+        for p in await query_db(
+                "SELECT company_id, first_name, last_name, title, email, email_status, "
+                "linkedin_url, source FROM prospects WHERE status IS NOT 'opted_out' "
+                "ORDER BY (first_name != '') DESC, score DESC"):
+            people.setdefault(p["company_id"], []).append(p)
+        async with aiosqlite.connect(state.db_path) as db:
+            signals = await _key_signals(db, {c["id"] for c in companies})
+        for c in companies:
+            if not c["phone_type"]:      # only a validated number is shown
+                c["phone"] = c["phone_source"] = ""
+            c.update(signals.get(c["id"], {}))
+            c["contacts"] = people.get(c["id"], [])
+        return {"brands": companies}
+    except Exception as e:
+        logger.exception("leads brands failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/runs")
 async def get_runs_api():
     """The collector run log — what ran, when, what it produced and cost."""

@@ -75,6 +75,14 @@ class ICPConfig(BaseModel):
     # Each variant runs in every city alongside the industry itself, so the
     # estimate grows with it. Empty → each industry is its own one search.
     keyword_variants: dict[str, list[str]] = {}
+    # Two-letter country Google searches run from (Serper's "gl"), e.g. "IN".
+    # Empty → Serper's default, which is the US.
+    search_country: str = ""
+
+    @field_validator("search_country", mode="before")
+    @classmethod
+    def _lower_search_country(cls, v) -> str:
+        return str(v or "").strip().lower()
 
 
 class WarmupConfig(BaseModel):

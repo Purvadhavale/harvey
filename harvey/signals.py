@@ -384,6 +384,57 @@ SIGNAL_CATALOG: list[dict] = [
         "cost_note": "free (site HTML)",
         "confidence_floor": 0.0,
     },
+    {
+        "code": "LINKEDIN_PAGE",
+        "label": "LinkedIn company page",
+        "description": "The brand's LinkedIn company page, as linked from its own website.",
+        "category": "profile",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "free (site HTML)",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "SOCIAL_PROFILE",
+        "label": "Social profiles",
+        "description": (
+            "Instagram, YouTube, Facebook and X profiles the brand links from "
+            "its own website, one row each (the text names the network)."
+        ),
+        "category": "profile",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "free (site HTML)",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "MARKETING_EMAIL",
+        "label": "Marketing or collab inbox",
+        "description": (
+            "An address on the brand's own domain for marketing, collabs, "
+            "partnerships or press (collab@, marketing@, pr@), published on its site."
+        ),
+        "category": "verification",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "free (site HTML)",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "PHONE_FOUND",
+        "label": "Phone number found",
+        "description": (
+            "A phone number on the site's homepage or contact page (tel: link, "
+            "WhatsApp link or text), checked as a real number for the region, "
+            "with whether it's a mobile or a landline. Usually the brand's "
+            "support line, not the founder's."
+        ),
+        "category": "verification",
+        "value_type": "text",
+        "collector": "profile",
+        "cost_note": "free (site HTML)",
+        "confidence_floor": 0.0,
+    },
 ]
 
 

@@ -1,4 +1,4 @@
-let currentTab = 'today';
+let currentTab = 'leads';
 let companyDrill = false;      // true while viewing a single company's contacts
 let _companies = [], _prospects = [], _campaigns = [];
 let _signals = null;           // last /api/signals payload, for the cohort builder
@@ -16,8 +16,15 @@ function applyTheme(mode) {
   const root = document.documentElement;
   if (mode === 'auto') root.removeAttribute('data-theme');
   else root.setAttribute('data-theme', mode);
-  const btn = document.getElementById('theme-btn');
-  if (btn) btn.textContent = mode;
+  document.querySelectorAll('[data-theme-opt]').forEach(b => {
+    b.classList.toggle('active', b.dataset.themeOpt === mode);
+    b.setAttribute('aria-pressed', b.dataset.themeOpt === mode);
+  });
+}
+
+function setTheme(mode) {
+  try { localStorage.setItem('harvey-theme', mode); } catch { /* private mode */ }
+  applyTheme(mode);
 }
 
 function cycleTheme() {
@@ -354,7 +361,7 @@ function unlockWithToken(event) {
   }
   hideLock();
   loadCurrentTab();
-  loadHarveyStatus();
+  loadLeadStatus();
 }
 
 // Downloads go through the same authorised fetch and are handed to the
@@ -409,6 +416,10 @@ function loadCurrentTab() {
   switch (currentTab) {
     case 'today': loadLiveStatus(); loadToday(); loadTrend(); loadFunnel(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
+    case 'leads': loadLeads(); break;
+    case 'brands': loadBrands(); break;
+    case 'people': loadPeople(); break;
+    case 'find': loadFind(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
@@ -417,7 +428,7 @@ function loadCurrentTab() {
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadSendingModeCard(); break;
+    case 'settings': loadSettings(); break;
     case 'controls': loadHarveyStatus(); loadLogs(); break;
   }
 }
@@ -1033,6 +1044,378 @@ function renderDiscoverResult(report, running) {
       : '');
 }
 
+// ── Leads: overview, brands, people and the step runner ──
+
+let _leadsPoll = null;
+let _leadStatus = null;
+let _brands = [];
+let _brandFilter = 'all', _peopleFilter = 'all';
+const LEAD_EMAIL_TONE = {verified: 'good', risky: 'waiting', guess: 'note', invalid: 'bad'};
+const VERIFY_ORDER = [
+  ['verified', 'Verified', 'var(--good)'], ['risky', 'Risky', 'var(--wait)'],
+  ['guess', 'Guess', 'var(--note)'], ['invalid', 'Invalid', 'var(--bad)'], ['none', 'No email', 'var(--surface-3)'],
+];
+const BRAND_FILTERS = [
+  ['all', 'All'], ['people', 'Has people'], ['verified', 'Verified email'], ['linkedin', 'LinkedIn profile'],
+  ['meta', 'Meta ads'], ['google', 'Google ads'], ['phone', 'Has phone'],
+];
+const PEOPLE_FILTERS = [
+  ['all', 'All'], ['named', 'Named people'], ['verified', 'Verified email'],
+  ['linkedin', 'LinkedIn profile'], ['ads', 'Brand runs ads'], ['inbox', 'Brand inboxes'],
+];
+
+// Scraped URLs: safeHref keeps only http(s), so a javascript: link never renders.
+function extLink(url, html, cls) {
+  const h = safeHref(url);
+  return h ? '<a class="' + (cls || '') + '" href="' + h + '" target="_blank" rel="noopener noreferrer">' + html + '</a>' : '';
+}
+function fullName(p) { return ((p.first_name || '') + ' ' + (p.last_name || '')).trim(); }
+function isNamed(p) { return !!(p.first_name || '').trim(); }
+// The domain, not `website`: that is often the search result the brand was found on.
+function siteUrl(b) { return b.domain ? 'https://' + b.domain : ''; }
+function igUrl(handle) {
+  const h = (handle || '').split(';')[0].trim();
+  if (!h) return '';
+  return /^https?:/i.test(h) ? h : 'https://www.instagram.com/' + encodeURIComponent(h.replace(/^@/, '')) + '/';
+}
+function emailBadge(status) {
+  const s = status || 'none';
+  return '<span class="vbadge v-' + escHtml(s) + '">' + (s === 'none' ? 'no email' : escHtml(s)) + '</span>';
+}
+// Meta / Google pill: yes = running, no = checked and none, '' = site not read yet.
+function adPill(label, value) {
+  if (value === 'yes') return '<span class="adpill on" title="' + label + ' tag found on their site">' + label + '</span>';
+  if (value === 'no') return '<span class="adpill off" title="No ' + label + ' tag on their site">No ' + label + '</span>';
+  return '<span class="adpill unknown" title="Website not read yet">' + label + ' ?</span>';
+}
+function copyBtn(text) {
+  return text ? '<button class="copy-btn" title="Copy" onclick="copyText(' + jsq(text) + ', this)">' + icon('copy') + '</button>' : '';
+}
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text); showToast('Copied ' + text, 'success'); }
+  catch (e) { showToast('Could not copy.', 'error'); }
+}
+function chipRow(elId, filters, active, setter) {
+  document.getElementById(elId).innerHTML = filters.map(([k, label]) =>
+    '<button class="lchip' + (k === active ? ' active' : '') + '" onclick="' + setter + '(' + jsq(k) + ')">' + label + '</button>').join('');
+}
+function brandScore(b) {
+  const named = b.contacts.filter(isNamed);
+  return named.filter(p => p.email_status === 'verified').length * 10 + named.length * 4 +
+    b.contacts.filter(p => p.email_status === 'verified').length * 2 +
+    named.filter(p => p.linkedin_url).length * 3 +
+    (b.meta_ads === 'yes' ? 3 : 0) + (b.google_ads === 'yes' ? 3 : 0) + (b.phone ? 1 : 0);
+}
+
+async function loadLeadStatus() {
+  const s = await api('/api/leads/status');
+  if (!s || s.error) return null;
+  _leadStatus = s;
+  const dot = document.getElementById('header-dot'), text = document.getElementById('header-status-text');
+  if (dot && !_locked) {
+    dot.className = 'status-dot ' + (s.busy ? 'running' : 'stopped');
+    text.textContent = s.busy ? 'Running: ' + s.busy : 'Idle';
+  }
+  const nav = document.getElementById('nav-leads');
+  if (nav) { nav.textContent = s.busy ? '•' : ''; nav.className = 'nav-count' + (s.busy ? ' on' : ''); }
+  if (s.busy && !_leadsPoll) _leadsPoll = setInterval(() => {
+    if (document.hidden || _locked) return;
+    if (currentTab === 'find') loadFind();
+    else loadLeadStatus();
+  }, 3000);
+  if (!s.busy && _leadsPoll) {
+    clearInterval(_leadsPoll); _leadsPoll = null;
+    if (['leads', 'brands', 'people'].includes(currentTab)) loadCurrentTab();   // pick up the new results
+  }
+  return s;
+}
+
+async function loadBrandsData() {
+  const data = await api('/api/leads/brands');
+  if (!data || data.error) return false;
+  _brands = data.brands || [];
+  navCount('nav-brands', _brands.length);
+  navCount('nav-people', _brands.reduce((n, b) => n + b.contacts.filter(isNamed).length, 0));
+  return true;
+}
+
+// ── Overview ──
+
+async function loadLeads() {
+  const [s, ok] = await Promise.all([loadLeadStatus(), loadBrandsData()]);
+  const kpis = document.getElementById('leads-kpis');
+  if (!s || !ok) { kpis.innerHTML = offlineState(); return; }
+  const es = s.email_status || {};
+  const people = _brands.flatMap(b => b.contacts);
+  const named = people.filter(isNamed);
+  const meta = _brands.filter(b => b.meta_ads === 'yes').length;
+  const google = _brands.filter(b => b.google_ads === 'yes').length;
+  const kpi = (label, value, sub, tone, tab) =>
+    '<button class="lk' + (tone ? ' lk-' + tone : '') + '"' + (tab ? ' onclick="goTab(' + jsq(tab) + ')"' : ' disabled') + '>' +
+    '<span class="lk-label">' + label + '</span><span class="lk-value">' + value + '</span>' +
+    '<span class="lk-sub">' + sub + '</span></button>';
+  kpis.innerHTML = '<div class="lk-grid">' +
+    kpi('Brands', _brands.length, s.websites_read + ' websites read', '', 'brands') +
+    kpi('Decision-makers', named.length, named.filter(p => p.linkedin_url).length + ' with LinkedIn', 'accent', 'people') +
+    kpi('Verified emails', es.verified || 0, (es.risky || 0) + ' risky · ' + (es.guess || 0) + ' to check', 'good', 'people') +
+    kpi('Running Meta ads', meta, 'of ' + s.websites_read + ' brands checked', 'meta', 'brands') +
+    kpi('Running Google ads', google, 'of ' + s.websites_read + ' brands checked', 'google', 'brands') +
+    kpi('Brand phones', s.phones, s.instagram + ' Instagram · ' + s.linkedin_pages + ' LinkedIn pages', '', 'brands') +
+    '</div>';
+
+  // Ready to pitch: a named person with a verified email, best first.
+  const ready = _brands.filter(b => b.contacts.some(p => isNamed(p) && p.email_status === 'verified'))
+    .sort((a, b) => brandScore(b) - brandScore(a));
+  const readyEl = document.getElementById('leads-ready');
+  readyEl.innerHTML = ready.length
+    ? '<div class="brand-grid">' + ready.slice(0, 6).map(brandCard).join('') + '</div>' +
+      (ready.length > 6 ? '<button class="btn btn-ghost btn-sm" style="margin-top:12px" onclick="_brandFilter=\'verified\';goTab(\'brands\')">See all ' + ready.length + '</button>' : '')
+    : '<div class="card">' + emptyState(icon('contacts'), 'No one ready yet',
+        'Brands show here once a <b>named person</b> there has a <b>verified email</b>. Run steps 3 and 4 in Find leads.') + '</div>';
+
+  // Email verification: one stacked bar, then the counts.
+  const total = VERIFY_ORDER.reduce((n, [k]) => n + (es[k] || 0), 0);
+  document.getElementById('leads-verify').innerHTML = total
+    ? '<div class="stack-bar">' + VERIFY_ORDER.map(([k, l, c]) => es[k]
+        ? '<span style="flex:' + es[k] + ';background:' + c + '" title="' + l + ': ' + es[k] + '"></span>' : '').join('') + '</div>' +
+      '<div class="vlegend">' + VERIFY_ORDER.map(([k, l, c]) =>
+        '<div class="vrow"><span class="sw" style="background:' + c + '"></span>' + l + '<b>' + (es[k] || 0) + '</b></div>').join('') + '</div>'
+    : '<div class="muted">No emails found yet.</div>';
+
+  const checked = s.websites_read || 0;
+  const bar = (label, n, cls) => '<div class="vrow"><span class="adpill ' + cls + '" style="min-width:96px">' + label + '</span>' +
+    '<span class="meter-inline"><span style="width:' + (checked ? Math.round(n / checked * 100) : 0) + '%"></span></span><b>' + n + '</b></div>';
+  document.getElementById('leads-ads').innerHTML = checked
+    ? bar('Meta ads', meta, 'on') + bar('Google ads', google, 'on') +
+      bar('Both', _brands.filter(b => b.meta_ads === 'yes' && b.google_ads === 'yes').length, 'on') +
+      '<div class="cell-sub" style="margin-top:8px">Out of ' + checked + ' brand websites read.</div>'
+    : '<div class="muted">Read websites (step 2) to see who runs ads.</div>';
+
+  const step = (label, done, total) => '<div class="prog-row"><span>' + label + '</span><span class="meter-inline"><span style="width:' +
+    (total ? Math.round(done / total * 100) : 0) + '%"></span></span><b>' + done + '/' + total + '</b></div>';
+  document.getElementById('leads-progress').innerHTML =
+    step('Websites read', s.websites_read, s.brands) +
+    step('Team pages', s.brands - s.team_pending, s.brands) +
+    step('LinkedIn searched', s.brands - s.linkedin_pending, s.brands) +
+    '<div class="cell-sub" style="margin-top:8px">Serper searches used: <b>' + s.serper_used + '</b> of 2,500 free.' +
+    (s.busy ? '<br>Running now: ' + escHtml(s.busy) : '') + '</div>';
+}
+
+// ── Brands ──
+
+function brandCard(b) {
+  const named = b.contacts.filter(isNamed), inboxes = b.contacts.filter(p => !isNamed(p));
+  const logo = (b.name || b.domain || '?').replace(/[^A-Za-z0-9 ]/g, '').split(/\s+/).filter(Boolean)
+    .slice(0, 2).map(w => w[0]).join('').toUpperCase() || '?';
+  const facts = [];
+  if (b.phone) facts.push('<span class="fact">' + icon('phone') + '<a href="tel:' + escHtml(b.phone) + '">' + escHtml(b.phone) + '</a>' +
+    (b.phone_type ? '<span class="cell-sub">' + escHtml(b.phone_type.replace('_', ' ')) + '</span>' : '') + '</span>');
+  if (b.instagram) facts.push('<span class="fact">' + icon('instagram') + extLink(igUrl(b.instagram), escHtml(b.instagram.split(';')[0])) + '</span>');
+  if (b.linkedin_page) facts.push('<span class="fact">' + icon('linkedin') + extLink(b.linkedin_page.split(';')[0].trim(), 'LinkedIn page') + '</span>');
+  if (b.marketing_email) facts.push('<span class="fact">' + icon('mail') + '<span>' + escHtml(b.marketing_email.split(';')[0]) + '</span>' + copyBtn(b.marketing_email.split(';')[0].trim()) + '</span>');
+  const tags = [];
+  if (b.funding_round) tags.push('<span class="tag accent" title="' + escHtml(b.funding_round) + '">Funding: ' + escHtml(b.funding_round.split(';')[0].slice(0, 40)) + '</span>');
+  if (b.hiring_roles) { const roles = b.hiring_roles.split(';').map(r => r.trim()).filter(Boolean);
+    tags.push('<span class="tag" title="' + escHtml(roles.join('\n')) + '">Hiring · ' + roles.length + ' role' + (roles.length > 1 ? 's' : '') + '</span>'); }
+  if (b.tech_stack) tags.push('<span class="tag">' + escHtml(b.tech_stack.split(';').slice(0, 3).join(', ')) + '</span>');
+
+  let people = named.map(p =>
+    '<div class="person">' +
+      '<span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' +
+      '<div class="person-main"><div class="person-name">' + escHtml(fullName(p)) +
+        (p.linkedin_url ? extLink(p.linkedin_url, icon('linkedin') + 'Profile', 'li-btn') : '') + '</div>' +
+        '<div class="person-title">' + escHtml(p.title || '—') + '</div></div>' +
+      '<div class="person-email">' + (p.email ? '<span class="email-line"><span class="email-text">' + escHtml(p.email) + '</span>' + copyBtn(p.email) + '</span>' : '') + emailBadge(p.email ? p.email_status : 'none') + '</div>' +
+    '</div>').join('');
+  if (inboxes.length) people += '<div class="inboxes">' + icon('mail') + inboxes.map(p =>
+    '<span class="inbox">' + escHtml(p.email) + ' ' + emailBadge(p.email_status) + '</span>').join('') + '</div>';
+  if (!b.contacts.length) people = '<div class="muted small">No people yet. ' +
+    (b.people_searched_at ? 'LinkedIn search found no one.' : 'Run team pages or LinkedIn search.') + '</div>';
+
+  return '<article class="brand-card">' +
+    '<header class="bc-head"><span class="bc-logo">' + escHtml(logo) + '</span>' +
+      '<div class="bc-title"><h3>' + escHtml(b.name || b.domain) + '</h3>' +
+        extLink(siteUrl(b), escHtml(b.domain) + icon('external'), 'bc-domain') + '</div>' +
+      '<div class="bc-ads">' + adPill('Meta ads', b.meta_ads) + adPill('Google ads', b.google_ads) + '</div></header>' +
+    '<div class="bc-meta">' + [b.industry, b.location].filter(Boolean).map(escHtml).join(' · ') + '</div>' +
+    (b.description ? '<p class="bc-desc">' + escHtml(b.description) + '</p>' : '') +
+    (facts.length ? '<div class="bc-facts">' + facts.join('') + '</div>' : '') +
+    (tags.length ? '<div class="bc-tags">' + tags.join('') + '</div>' : '') +
+    '<div class="bc-people"><div class="bc-people-head">People <span>' + named.length + '</span></div>' + people + '</div>' +
+  '</article>';
+}
+
+function brandMatches(b, f) {
+  switch (f) {
+    case 'people': return b.contacts.some(isNamed);
+    case 'verified': return b.contacts.some(p => p.email_status === 'verified');
+    case 'linkedin': return b.contacts.some(p => p.linkedin_url);
+    case 'meta': return b.meta_ads === 'yes';
+    case 'google': return b.google_ads === 'yes';
+    case 'phone': return !!b.phone;
+    default: return true;
+  }
+}
+function setBrandFilter(f) { _brandFilter = f; renderBrands(); }
+
+async function loadBrands() {
+  if (!await loadBrandsData()) { document.getElementById('brands-list').innerHTML = offlineState(); return; }
+  renderBrands();
+}
+
+function renderBrands() {
+  chipRow('brands-chips', BRAND_FILTERS.map(([k, l]) => [k, l + ' <span>' + _brands.filter(b => brandMatches(b, k)).length + '</span>']), _brandFilter, 'setBrandFilter');
+  const q = (document.getElementById('brands-search').value || '').trim().toLowerCase();
+  const sort = document.getElementById('brands-sort').value;
+  const rows = _brands.filter(b => brandMatches(b, _brandFilter) && (!q ||
+    [b.name, b.domain, b.industry, b.location, b.instagram, ...b.contacts.map(p => fullName(p) + ' ' + p.title + ' ' + p.email)]
+      .join(' ').toLowerCase().includes(q)));
+  if (sort === 'best') rows.sort((a, b) => brandScore(b) - brandScore(a));
+  else if (sort === 'name') rows.sort((a, b) => (a.name || a.domain).localeCompare(b.name || b.domain));
+  document.getElementById('brands-count').textContent = rows.length + ' of ' + _brands.length + ' brands';
+  document.getElementById('brands-list').innerHTML = rows.length
+    ? '<div class="brand-grid">' + rows.map(brandCard).join('') + '</div>'
+    : '<div class="card">' + emptyState(icon('companies'), _brands.length ? 'No brands match' : 'No brands yet',
+        _brands.length ? 'Try another filter or search.' : 'Run <b>Find brands</b> in Find leads.') + '</div>';
+}
+
+// ── People ──
+
+function personMatches(r, f) {
+  switch (f) {
+    case 'named': return isNamed(r.p);
+    case 'verified': return r.p.email_status === 'verified';
+    case 'linkedin': return !!r.p.linkedin_url;
+    case 'ads': return r.b.meta_ads === 'yes' || r.b.google_ads === 'yes';
+    case 'inbox': return !isNamed(r.p);
+    default: return true;
+  }
+}
+function setPeopleFilter(f) { _peopleFilter = f; renderPeople(); }
+
+async function loadPeople() {
+  if (!await loadBrandsData()) { document.getElementById('people-list').innerHTML = offlineState(); return; }
+  renderPeople();
+}
+
+function renderPeople() {
+  const all = _brands.flatMap(b => b.contacts.map(p => ({p, b})));
+  chipRow('people-chips', PEOPLE_FILTERS.map(([k, l]) => [k, l + ' <span>' + all.filter(r => personMatches(r, k)).length + '</span>']), _peopleFilter, 'setPeopleFilter');
+  const q = (document.getElementById('people-search').value || '').trim().toLowerCase();
+  const rank = {verified: 0, risky: 1, guess: 2, '': 3, invalid: 4};
+  const rows = all.filter(r => personMatches(r, _peopleFilter) && (!q ||
+      [fullName(r.p), r.p.title, r.p.email, r.b.name, r.b.domain].join(' ').toLowerCase().includes(q)))
+    .sort((x, y) => (isNamed(y.p) - isNamed(x.p)) || ((rank[x.p.email_status || ''] ?? 3) - (rank[y.p.email_status || ''] ?? 3)) ||
+      (!!y.p.linkedin_url - !!x.p.linkedin_url));
+  document.getElementById('people-count').textContent = rows.length + ' of ' + all.length + ' contacts';
+  const el = document.getElementById('people-list');
+  if (!rows.length) {
+    el.innerHTML = '<div class="card">' + emptyState(icon('contacts'), all.length ? 'No one matches' : 'No people yet',
+      all.length ? 'Try another filter or search.' : 'Run <b>Team pages</b> or <b>LinkedIn search</b> in Find leads.') + '</div>';
+    return;
+  }
+  let html = '<div class="table-card"><table class="people-table"><thead><tr><th>Person</th><th>LinkedIn</th><th>Brand</th>' +
+    '<th>Email</th><th>Brand phone</th><th>Ads</th></tr></thead><tbody>';
+  for (const {p, b} of rows) {
+    const named = isNamed(p);
+    html += '<tr>' +
+      '<td><div class="cell-row">' + (named ? '<span class="avatar">' + initials(p.first_name, p.last_name) + '</span>' : '<span class="avatar inbox-av">' + icon('mail') + '</span>') +
+        '<div class="cell-stack"><span class="person-name">' + (named ? escHtml(fullName(p)) : '<span class="muted">Brand inbox</span>') + '</span>' +
+        '<span class="cell-sub">' + escHtml(p.title || '') + '</span></div></div></td>' +
+      '<td>' + (p.linkedin_url ? extLink(p.linkedin_url, icon('linkedin') + 'View profile', 'li-btn') : '<span class="muted">—</span>') + '</td>' +
+      '<td><div class="cell-stack"><span class="cell-main">' + escHtml(b.name || b.domain) + '</span>' +
+        extLink(siteUrl(b), escHtml(b.domain), 'cell-sub') + '</div></td>' +
+      '<td><div class="cell-stack">' + (p.email ? '<span class="email-line"><span class="email-text">' + escHtml(p.email) + '</span>' + copyBtn(p.email) + '</span>' : '') +
+        emailBadge(p.email ? p.email_status : 'none') + '</div></td>' +
+      '<td>' + (b.phone ? '<div class="cell-stack"><a href="tel:' + escHtml(b.phone) + '">' + escHtml(b.phone) + '</a><span class="cell-sub">' + escHtml(b.phone_type.replace('_', ' ')) + '</span></div>' : '<span class="muted">—</span>') + '</td>' +
+      '<td><div class="ad-stack">' + adPill('Meta', b.meta_ads) + adPill('Google', b.google_ads) + '</div></td>' +
+    '</tr>';
+  }
+  el.innerHTML = html + '</tbody></table></div>';
+}
+
+// ── Find leads: each step by hand, with live status ──
+
+async function loadFind() {
+  const s = await loadLeadStatus();
+  if (!s) { document.getElementById('leads-job').innerHTML = offlineState(); return; }
+  const es = s.email_status || {};
+  const pend = (id, n, word) => {
+    const el = document.getElementById(id);
+    if (el) { el.className = 'step-pending' + (n ? '' : ' done'); el.textContent = n ? n + ' ' + word : 'All done'; }
+  };
+  pend('leads-pending-web', s.websites_pending, 'brands not read yet');
+  pend('leads-pending-team', s.team_pending, 'brands not checked yet');
+  pend('leads-pending-li', s.linkedin_pending, 'brands not searched yet');
+  pend('leads-pending-guess', es.guess || 0, 'guessed emails waiting');
+  pend('leads-pending-invalid', es.invalid || 0, 'invalid emails');
+  ['discover', 'profile', 'team', 'linkedin', 'reverify', 'retry'].forEach(k => {
+    const b = document.getElementById('leads-btn-' + k);
+    if (b) b.disabled = !!s.busy;
+  });
+  renderLeadsJob(s);
+}
+
+function renderLeadsJob(s) {
+  const el = document.getElementById('leads-job');
+  const job = s.job || {};
+  if (s.busy && !job.running) {
+    el.innerHTML = '<div class="qtitle">Busy: ' + escHtml(s.busy) + '</div>' +
+      '<div class="qdetail">Started from the Discover tab. Counts update as it goes.</div>';
+    return;
+  }
+  if (!job.kind) { el.innerHTML = '<div class="muted">Nothing running. Pick a step above.</div>'; return; }
+  let head = '<div class="qtitle">' + escHtml(job.label || job.kind) + ' — ' +
+    (job.running ? 'running…' : job.error ? 'failed' : 'finished') + '</div>' +
+    '<div class="qdetail">Started ' + formatDate(job.started) +
+    (job.finished ? ' · finished ' + formatDate(job.finished) : '') + '</div>';
+  if (job.error) head += '<div class="test-result error" style="margin-top:8px">' + escHtml(job.error) + '</div>';
+  if (job.result) {
+    const r = job.result;
+    head += '<div class="qdetail" style="margin-top:6px">' + (r.contacts_added !== undefined
+      ? r.contacts_added + ' new contact(s)'
+      : Object.entries(r.email_status || {}).map(([k, v]) => v + ' ' + k).join(' · ') || 'nothing to re-check') + '</div>';
+  }
+  el.innerHTML = head + ((job.log || []).length
+    ? '<pre class="leads-log">' + escHtml(job.log.join('\n')) + '</pre>' : '');
+  const log = el.querySelector('.leads-log');
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+async function leadsRun(step, btn) {
+  btn.disabled = true;
+  const data = await api('/api/leads/run', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({step: step, cycles: 3})});
+  if (data && data.success) showToast('Started.', 'success');
+  else { showToast(failMsg(data, 'Could not start.'), 'error'); btn.disabled = false; }
+  loadFind();
+}
+
+async function leadsProfile(btn) {
+  btn.disabled = true;
+  const data = await api('/api/profile/run', {method: 'POST'});
+  if (data && data.success) showToast(data.pending ? 'Reading ' + Math.min(data.pending, 200) + ' websites.' : 'Every site is already read.', 'success');
+  else { showToast(failMsg(data, 'Could not start.'), 'error'); btn.disabled = false; }
+  loadFind();
+}
+
+async function leadsDiscover(btn) {
+  const cities = document.getElementById('leads-cities').value.split(/[;\n]/).map(c => c.trim()).filter(Boolean);
+  const body = {provider: 'serper', cities: cities, preset: document.getElementById('leads-preset').value,
+                depth: 10, limit: 100, max_spend: 1.0};
+  btn.disabled = true;
+  const est = await api('/api/discover/estimate', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)});
+  if (!est || est.error) { showToast(failMsg(est, 'Could not estimate.'), 'error'); btn.disabled = false; return; }
+  const sample = est.queries.slice(0, 6).join('\n') + (est.query_count > 6 ? '\n… and ' + (est.query_count - 6) + ' more' : '');
+  if (!confirm('This uses ' + est.query_count + ' Serper searches:\n\n' + sample + '\n\nRun it?')) { btn.disabled = false; return; }
+  const run = await api('/api/discover/run', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)});
+  if (run && run.success) showToast('Finding brands: ' + run.queries + ' searches, then reading their sites.', 'success');
+  else { showToast(failMsg(run, 'Could not start.'), 'error'); btn.disabled = false; }
+  loadFind();
+}
+
 // ── Cohort builder: a prospect list is a query ──
 
 let _cohort = { require: new Set(), exclude: new Set(), ranges: {} };
@@ -1240,23 +1623,25 @@ async function loadSettings() {
     el.textContent = ok ? okLabel : 'not set';
   };
 
-  // Non-secret values repopulate
-  document.getElementById('gmail-id').value = data.gmail_client_id || '';
-  document.getElementById('smtp-host').value = data.smtp_host || '';
-  document.getElementById('smtp-port').value = data.smtp_port || '';
-  document.getElementById('smtp-user').value = data.smtp_username || '';
-  document.getElementById('imap-host').value = data.imap_host || '';
-  document.getElementById('imap-port').value = data.imap_port || '';
-  document.getElementById('imap-user').value = data.imap_username || '';
-  document.getElementById('m365-client').value = data.m365_client_id || '';
-  document.getElementById('m365-tenant').value = data.m365_tenant_id || '';
-  document.getElementById('linkedin-email').value = data.linkedin_email || '';
-  document.getElementById('cf-account-id').value = data.cloudflare_account_id || '';
+  // Non-secret values repopulate (only the fields this page shows)
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+  setVal('gmail-id', data.gmail_client_id);
+  setVal('smtp-host', data.smtp_host);
+  setVal('smtp-port', data.smtp_port);
+  setVal('smtp-user', data.smtp_username);
+  setVal('imap-host', data.imap_host);
+  setVal('imap-port', data.imap_port);
+  setVal('imap-user', data.imap_username);
+  setVal('m365-client', data.m365_client_id);
+  setVal('m365-tenant', data.m365_tenant_id);
+  setVal('linkedin-email', data.linkedin_email);
+  setVal('cf-account-id', data.cloudflare_account_id);
 
   savedPh('gmail-secret', data.gmail_client_secret_set, 'Enter client secret');
   savedPh('smtp-pass', data.smtp_password_set, 'Enter password / app password');
   savedPh('imap-pass', data.imap_password_set, 'Same as SMTP password');
-  document.getElementById('imap-same-pass').checked = !data.imap_password_set;
+  const samePass = document.getElementById('imap-same-pass');
+  if (samePass) samePass.checked = !data.imap_password_set;
   savedPh('instantly-key', data.instantly_api_key_set, 'Enter your Instantly API key');
   savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
   savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
@@ -2654,48 +3039,27 @@ async function loadActivity() {
 }
 
 // ── Init & live refresh ──
+//
+// Lead finding only: no heartbeat, outbox or reply polling. The status in the
+// sidebar foot is the lead job, refreshed while a step runs (see loadLeadStatus).
 
-loadToday();
-loadTrend();
-loadFunnel();
-loadSetupStatus();
-loadRuns();
-loadTodayActivity();
-loadHarveyStatus();
+// ?tab=brands (or people, find, …) opens straight on that page.
+(function openStartTab() {
+  const tab = new URLSearchParams(location.search).get('tab');
+  if (tab && /^[a-z]+$/.test(tab) && document.getElementById(tab)?.classList.contains('section')) goTab(tab);
+  else loadLeads();
+  if (tab) loadLeadStatus();     // the sidebar status, wherever the page opened
+})();
 
-loadLiveStatus();
-
-// Agent status: quick poll (not while locked: it would only be refused)
-setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
-
-// Live status panel: refreshed while the Today tab is open and visible.
+// Lead pages: auto-refresh without clobbering a search or filter in progress
+// (renders re-read the inputs). Settings and help are deliberately excluded.
 setInterval(() => {
-  if (!document.hidden && !_locked && currentTab === 'today') loadLiveStatus();
-}, 10000);
-
-// Nav counts stay live wherever you are, so "something needs me" is visible
-// from any tab without polling that tab's contents.
-setInterval(async () => {
-  if (document.hidden || _locked || currentTab === 'today') return;
-  const data = await api('/api/today');
-  if (!data) return;
-  navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
-  navCount('nav-outbox', (data.stats || {}).outbox_pending || 0);
-}, 20000);
-
-// Data tabs: auto-refresh live views without clobbering anything in progress.
-// Outbox, settings and help are deliberately excluded — re-rendering the desk
-// under someone mid-decision loses their place, and settings may be mid-edit.
-setInterval(() => {
-  if (document.hidden || _locked) return;
+  if (document.hidden || _locked || _leadsPoll) return;
   switch (currentTab) {
-    case 'today': loadToday(); loadTrend(); loadFunnel(); loadRuns(); loadTodayActivity(); break;
-    case 'companies': if (!companyDrill) loadCompanies(); break;
-    case 'prospects': loadProspects(); break;
-    case 'campaigns': loadCampaigns(); break;
-    case 'conversations': loadConversations(); break;
+    case 'leads': loadLeads(); break;
+    case 'brands': loadBrands(); break;
+    case 'people': loadPeople(); break;
+    case 'find': loadFind(); break;
     case 'activity': loadActivity(); break;
-    case 'usage': loadUsage(); break;
-    case 'controls': loadLogs(); break;
   }
-}, 15000);
+}, 30000);

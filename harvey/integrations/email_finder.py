@@ -723,6 +723,89 @@ async def verify_published_address(email: str, env=None) -> str:
     return status or "guess"
 
 
+async def reverify_guesses(state, env=None, limit: int = 100) -> dict[str, int]:
+    """Re-check addresses left as "guess" (a verifier was out of credits or
+    couldn't decide) and record any verdict that's now conclusive.
+
+    Run monthly, after the free tiers reset. Each address costs at most one
+    credit per verifier tried; an inconclusive answer leaves it a guess.
+    Returns how many addresses ended in each status.
+    """
+    counts: dict[str, int] = {}
+    for prospect in await state.prospects_with_email_status("guess", limit=limit):
+        email = (prospect.email or "").strip().lower()
+        domain = email.partition("@")[2]
+        mx_host = await get_mx_host(domain) if domain else None
+        if not mx_host:
+            status = "invalid"
+        else:
+            status, _ = await _verify_candidate(email, classify_mx(mx_host), env)
+            status = status or "guess"
+        if status != "guess":
+            await state.update_prospect_email(prospect.id, email, status)
+            logger.info(f"Reverify: {email} [{status}]")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+# After a verifier rejects the default-pattern guess, the formats worth one
+# more check each, most common first (Indian brands: first@ and first.last@
+# lead, then firstlast@ and initial+last).
+ALTERNATE_PATTERNS = ("{f}", "{f}{l}", "{fi}{l}", "{fi}.{l}")
+ALTERNATE_TRIES = 2
+
+
+async def _try_alternates(first, last, domain, mx_type, env, tried, limit,
+                          other_people=None, known_emails=None):
+    """(email, status, pattern) for the first alternate format a verifier
+    accepts (verified or risky), or None. At most ``limit`` checks."""
+    for pattern in ALTERNATE_PATTERNS:
+        if limit <= 0:
+            break
+        email = build_email(pattern, first, last, domain)
+        if not email or email in tried or _belongs_to_someone_else(
+                email, pattern, (first, last), domain, other_people, known_emails):
+            continue
+        tried.add(email)
+        limit -= 1
+        status, _ = await _verify_candidate(email, mx_type, env)
+        if status in ("verified", "risky"):
+            return email, status, pattern
+    return None
+
+
+async def retry_invalid_named(state, env=None, limit: int = 50, tries: int = ALTERNATE_TRIES) -> dict[str, int]:
+    """Named people whose guessed address was rejected: try other common
+    formats (at most ``tries`` checks each). Returns counts by new status."""
+    counts: dict[str, int] = {}
+    for prospect in await state.prospects_with_email_status("invalid", limit=limit):
+        email = (prospect.email or "").strip().lower()
+        domain = email.partition("@")[2]
+        if not (prospect.first_name and prospect.last_name and domain):
+            continue
+        mx_host = await get_mx_host(domain)
+        if not mx_host:
+            counts["invalid"] = counts.get("invalid", 0) + 1
+            continue
+        mx_type = classify_mx(mx_host)
+        last = prospect.last_name.split()[-1]
+        better = await _try_alternates(prospect.first_name, last, domain, mx_type, env,
+                                       tried={email}, limit=tries)
+        if better:
+            new_email, status, pattern = better
+            await state.update_prospect_email(prospect.id, new_email, status)
+            try:
+                await state.save_email_pattern(domain, pattern=pattern, source="verified_alternate",
+                                               confidence=0.9, mx_type=mx_type)
+            except Exception:
+                pass
+            logger.info(f"Retry: {prospect.first_name} {last}@{domain} -> {new_email} [{status}]")
+        else:
+            status = "invalid"
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
 def _belongs_to_someone_else(candidate, pattern, person, domain, other_people, known_emails) -> bool:
     me = (_clean_name_part(person[0]), _clean_name_part(person[1]))
     for email, first, last in known_emails or []:
@@ -748,6 +831,7 @@ async def find_email(
     known_emails: Optional[list[tuple[str, str, str]]] = None,
     default_pattern: str = DEFAULT_PATTERN,
     other_people: Optional[list[tuple[str, str]]] = None,
+    alternates: int = ALTERNATE_TRIES,
 ) -> EmailResult:
     """Find and honestly grade one email for a person at a company.
 
@@ -813,6 +897,22 @@ async def find_email(
             await state.save_email_pattern(domain, mx_type=mx_type, is_catch_all=1)
         except Exception:
             pass
+
+    if status == "invalid" and alternates > 0 and source in WEAK_SOURCES:
+        # The pattern was only a default, and the verifier says no such
+        # mailbox: try the next most common formats before giving up. A hit
+        # teaches the domain's real pattern, so colleagues cost one check.
+        better = await _try_alternates(first_name, last_name, domain, mx_type, env,
+                                       tried={candidate}, limit=alternates,
+                                       other_people=other_people, known_emails=known_emails)
+        if better:
+            candidate, status, pattern = better
+            if state is not None:
+                try:
+                    await state.save_email_pattern(domain, pattern=pattern, source="verified_alternate",
+                                                   confidence=0.9, mx_type=mx_type)
+                except Exception as e:
+                    logger.debug(f"Pattern cache write failed for {domain}: {e}")
 
     if status is None:
         # Verification couldn't decide — an honest guess, never "verified".

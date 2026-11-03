@@ -519,6 +519,23 @@ MIGRATIONS: list[str] = [
     -- knows about the recipient. Empty until then.
     ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
     """,
+    # ── v15: what kind of number companies.phone is, and where it came from ──
+    """
+    -- phone_type: mobile | landline | fixed_or_mobile | toll_free | voip |
+    -- other, '' until validated. phone_source: 'listing' (a discovery
+    -- provider's business listing) or 'website' (the profile collector).
+    -- Every phone before this came from a listing.
+    ALTER TABLE companies ADD COLUMN phone_type TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN phone_source TEXT DEFAULT '';
+    UPDATE companies SET phone_source = 'listing' WHERE phone != '';
+    """,
+    # ── v16: when Scout last searched for a company's people by name ──
+    """
+    -- Separate from prospects_checked_at (the team-page backfill): a search
+    -- costs a query, so it runs once per company, not every time the
+    -- backfill rotates back round.
+    ALTER TABLE companies ADD COLUMN people_searched_at TIMESTAMP DEFAULT NULL;
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -612,14 +629,18 @@ class StateManager:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO companies
                    (id, name, domain, website, description, industry,
-                    company_size, location, phone, source, source_url,
+                    company_size, location, phone, phone_type, phone_source,
+                    source, source_url,
                     external_id, notes, tech_stack_json, signals_json,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     company.id, company.name, company.domain, company.website,
                     company.description, company.industry, company.company_size,
-                    company.location, company.phone, company.source,
+                    company.location, company.phone, company.phone_type,
+                    # A phone arriving with the company came from its listing.
+                    company.phone_source or ("listing" if company.phone else ""),
+                    company.source,
                     company.source_url, company.external_id, company.notes,
                     json.dumps(company.tech_stack), json.dumps(company.signals),
                     company.created_at.isoformat(),
@@ -1920,6 +1941,39 @@ class StateManager:
             )
             await db.commit()
 
+    async def companies_for_people_search(self, limit: int = 10) -> list[dict]:
+        """Companies with a website whose people haven't been searched for,
+        oldest first."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT id, name, domain, industry FROM companies
+                   WHERE domain != '' AND people_searched_at IS NULL
+                   ORDER BY created_at LIMIT ?""",
+                (limit,),
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def mark_people_searched(self, company_id: str):
+        async with self._connect() as db:
+            await db.execute(
+                """UPDATE companies SET people_searched_at = CURRENT_TIMESTAMP,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (company_id,),
+            )
+            await db.commit()
+
+    async def set_company_phone(self, company_id: str, phone: str,
+                                phone_type: str, phone_source: str):
+        """Record a company's validated phone, its type and where it came from."""
+        async with self._connect() as db:
+            await db.execute(
+                """UPDATE companies SET phone = ?, phone_type = ?, phone_source = ?,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (phone, phone_type, phone_source, company_id),
+            )
+            await db.commit()
+
     async def rename_company(self, company_id: str, name: str):
         """Set a company's name, and the copy each of its prospects carries."""
         async with self._connect() as db:
@@ -2162,6 +2216,28 @@ class StateManager:
         async with self._connect() as db:
             async with db.execute(
                 "SELECT status, COUNT(*) FROM prospects GROUP BY status"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return {row[0]: row[1] for row in rows}
+
+    async def prospects_with_email_status(self, email_status: str, limit: int = 100) -> list[Prospect]:
+        """Prospects holding an address with this status, least recently
+        touched first, skipping opt-outs (never worth a verification credit)."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT * FROM prospects
+                   WHERE email != '' AND email_status = ? AND status IS NOT 'opted_out'
+                   ORDER BY updated_at ASC LIMIT ?""",
+                (email_status, limit),
+            ) as cursor:
+                return [self._prospect_from_row(row) for row in await cursor.fetchall()]
+
+    async def count_prospects_by_email_status(self) -> dict[str, int]:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COALESCE(NULLIF(email_status, ''), 'none'), COUNT(*) "
+                "FROM prospects GROUP BY 1"
             ) as cursor:
                 rows = await cursor.fetchall()
                 return {row[0]: row[1] for row in rows}

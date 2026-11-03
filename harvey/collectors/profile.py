@@ -23,6 +23,8 @@ from harvey.public_http import public_http_client
 from harvey.startups import funding_text
 
 from harvey.collectors.ats import detect_board, matching_roles, read_board, role_keywords
+from harvey.collectors.phones import extract_phones, rank as rank_phones, validate as validate_phone
+from harvey.collectors.socials import instagram_handle, marketing_emails, social_links
 
 from harvey.collectors.discover import (
     name_from_domain, name_matches_domain, site_name_from_html,
@@ -200,6 +202,9 @@ DECISION_MAKER_TITLES = (
     "office manager", "marketing director", "marketing manager",
     "director of marketing", "vice president", "vp ", "managing director",
     "chief", "director",
+    # Marketing buyers: brand, growth, social and influencer leads.
+    "head of", "brand head", "brand manager", "brand marketing", "growth",
+    "influencer marketing", "social media", "digital marketing", "partnerships",
 )
 
 
@@ -805,8 +810,10 @@ class ProfileCollector:
     """
 
     def __init__(self, state, confirmed: set[str] | None = None, timeout: float = 12.0,
-                 role_keywords: list[str] | None = None):
+                 role_keywords: list[str] | None = None, phone_region: str = "IN"):
         self.state = state
+        # Region numbers without a country code are read in (icp.search_country).
+        self.phone_region = phone_region or "IN"
         self.confirmed = confirmed if confirmed is not None else set()
         self.timeout = timeout
         # icp.hiring_signals (or icp.titles): which open roles are worth a row.
@@ -933,6 +940,62 @@ class ProfileCollector:
                     break
             for r in roles:
                 add("HIRING_ROLE", text=r, url=curl)
+    async def _contact_page(self, site: str) -> tuple[str, str]:
+        """(url, html) of the contact page, fetched once per site."""
+        cache = self.__dict__.setdefault("_contact_pages", {})
+        if site not in cache:
+            cache[site] = await self._first_present(site, CONTACT_PATHS)
+        return cache[site]
+
+    async def _socials(self, site: str, home: str, domain: str, add) -> None:
+        """LinkedIn page, social profiles and marketing inbox from the
+        homepage, then the contact page for whatever it didn't have."""
+        links = social_links(home)
+        emails = marketing_emails(home, domain)
+        if not (links.get("linkedin") and links.get("instagram") and emails):
+            curl, chtml = await self._contact_page(site)
+            if chtml:
+                links = {**social_links(chtml), **links}
+                emails = emails or marketing_emails(chtml, domain)
+        if links.get("linkedin"):
+            add("LINKEDIN_PAGE", text=links["linkedin"], url=links["linkedin"])
+        for net in ("instagram", "youtube", "facebook", "x"):
+            if links.get(net):
+                label = instagram_handle(links[net]) if net == "instagram" else links[net]
+                add("SOCIAL_PROFILE", text=f"{net}: {label}", url=links[net])
+        for email in emails[:3]:
+            add("MARKETING_EMAIL", text=email, url=site)
+
+    async def _phones(self, company_id: str, site: str, home: str, add) -> None:
+        """Valid numbers from the homepage and contact page: one observation
+        each, and the best one onto companies.phone. A valid listing phone
+        is kept; one this collector wrote earlier is replaced."""
+        phones = extract_phones(home, site, self.phone_region)
+        curl, chtml = await self._contact_page(site)
+        if chtml:
+            seen = {p.e164 for p in phones}
+            phones += [p for p in extract_phones(chtml, curl, self.phone_region) if p.e164 not in seen]
+        phones = rank_phones(phones)
+        for p in phones[:5]:
+            add("PHONE_FOUND", text=p.label(), url=p.url)
+        if not phones:
+            add("PHONE_FOUND", num=0, url=site)
+        if getattr(self, "state", None) is None:
+            return
+        company = await self.state.get_company(company_id)
+        if company is None:
+            return
+        existing = (company.phone or "").strip()
+        if existing and company.phone_source != "website":
+            checked = validate_phone(existing, self.phone_region)
+            if checked:
+                if company.phone_type != checked[1] or existing != checked[0]:
+                    await self.state.set_company_phone(company_id, checked[0], checked[1],
+                                                       company.phone_source or "listing")
+                return
+        if phones:
+            await self.state.set_company_phone(company_id, phones[0].e164, phones[0].type, "website")
+
     async def _search_hit(self, company_id: str, code: str) -> bool:
         """Is the latest reading a preset search's hit? (see state.search_hit)"""
         if getattr(self, "state", None) is None:
@@ -1088,6 +1151,7 @@ class ProfileCollector:
     async def profile_company(self, company_id: str, domain: str) -> list[dict]:
         """Collect every confirmed profile signal for one business."""
         obs: list[dict] = []
+        self._contact_pages = {}        # one company's contact page, reused by its detectors
         domain = domain.lower().replace("www.", "").strip("/")
         if any(domain == d or domain.endswith("." + d) for d in YC_OWNED_DOMAINS):
             # YC's own sites forbid scraping; they're never a prospect anyway.
@@ -1230,9 +1294,23 @@ class ProfileCollector:
             if re.search(r"(?is)<form\b", _strip_code(home)):
                 add("CONTACT_FORM_URL", text=site, url=site)
             else:
-                curl, chtml = await self._first_present(site, CONTACT_PATHS)
+                curl, chtml = await self._contact_page(site)
                 if chtml and re.search(r"(?is)<form\b", _strip_code(chtml)):
                     add("CONTACT_FORM_URL", text=curl, url=curl)
+
+        # social profiles + marketing inbox → homepage, then contact page
+        if self.wants("LINKEDIN_PAGE") or self.wants("SOCIAL_PROFILE") or self.wants("MARKETING_EMAIL"):
+            try:
+                await self._socials(site, home, domain, add)
+            except Exception as e:
+                logger.info(f"profile: {domain} socials unread: {type(e).__name__}: {e}")
+
+        # phone numbers → homepage and contact page, validated for the region
+        if self.wants("PHONE_FOUND"):
+            try:
+                await self._phones(company_id, site, home, add)
+            except Exception as e:
+                logger.info(f"profile: {domain} phones unread: {type(e).__name__}: {e}")
 
         # open roles → hiring intent. The job-board feed when their site
         # links one (titles, departments and dates for every role), else
@@ -1331,7 +1409,9 @@ async def profile_companies(state, companies: list[dict], config=None) -> tuple[
     run_id = await state.start_run("profile", provider="http")
     try:
         keywords = role_keywords(getattr(config, "icp", None))
-        async with ProfileCollector(state, confirmed, role_keywords=keywords) as collector:
+        region = (getattr(getattr(config, "icp", None), "search_country", "") or "IN").upper()
+        async with ProfileCollector(state, confirmed, role_keywords=keywords,
+                                    phone_region=region) as collector:
             n = await collector.run(companies, run_id=run_id)
         await state.finish_run(run_id, records=n, cost_usd=0.0)
         return n, run_id
